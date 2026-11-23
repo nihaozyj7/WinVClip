@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
+#include <cstdarg>
 #include <cmath>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -142,12 +143,18 @@ static HWND   g_main  = nullptr;
 static HWND   g_panel = nullptr;
 static HWND   g_target = nullptr;
 static HWND   g_pasteTarget = nullptr;
+// 唤起面板时，目标窗口内部那个有焦点的控件（地址栏的编辑框、搜索框…）。
+// SetForegroundWindow 只还原顶层窗口，控件级焦点得靠它自己处理：记事本能找回，
+// 资源管理器的地址栏 / 搜索框不能——那样粘过去的 Ctrl+V 会落到一个没有焦点的
+// 窗口上，表现就是「面板选完条目，输入框里什么都没出现」。
+static HWND   g_targetFocus = nullptr;
 
 static bool   g_lwin = false, g_rwin = false;
 static bool   g_swallowVUp = false;
 static bool   g_vDown = false;       // V 当前是否处于按下（用来识别长按产生的自动重复键）
 static DWORD  g_vDownAt = 0;
 static DWORD  g_shownAt = 0;
+static int    g_rescueTries = 0;     // 唤起瞬间允许重新抢回前台的次数，见 FocusStillOurs
 
 static std::deque<ClipItem> g_items;
 
@@ -3271,7 +3278,28 @@ static void PaintPanel(HWND hwnd) {
 }
 
 // ================================================================== 交互
+// ---- 诊断日志（默认关闭）：排查前台/焦点问题时设 WV_TRACE=1 启动，
+// 记录写到 %TEMP%\winvclip-trace.txt。默认路径上只有一次 getenv，开销可忽略。
+static void Trace(const char* fmt, ...) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("WV_TRACE"); on = (e && *e && *e != '0') ? 1 : 0; }
+    if (!on) return;
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    lstrcatW(path, L"winvclip-trace.txt");
+    FILE* f = nullptr;
+    _wfopen_s(&f, path, L"a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 static void HidePanel();
+static bool FocusStillOurs(HWND hwnd);
+static void RestoreTargetFocus(HWND target, HWND focus);
 static void ShowPanel();
 static void PasteItem(int vi);
 static void ForceForeground(HWND hwnd);
@@ -3741,8 +3769,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 轮询前台窗口：WM_ACTIVATE 在「面板是靠 AttachThreadInput 抢来的前台」时
             // 并不保证送达（实测有时收不到 WA_INACTIVE），只靠事件会让面板卡在屏幕上。
             if (!g_pinned && !g_dragging && !g_dialogOpen) {
-                HWND fg = GetForegroundWindow();
-                if (fg != hwnd) {
+                if (!FocusStillOurs(hwnd)) {
                     g_menuOpen = false;
                     g_modalOpen = false;
                     HidePanel();
@@ -4205,6 +4232,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_ACTIVATE:
+        Trace("WM_ACTIVATE wp=%d fg=%p", (int)LOWORD(wp), (void*)GetForegroundWindow());
         if (LOWORD(wp) == WA_INACTIVE) {
             if (g_dialogOpen) return 0;     // 另存为对话框是面板的 owned window
             // 固定态：不失焦隐藏；顺手把新的前台窗口记为粘贴目标，方便换个窗口继续插
@@ -4213,20 +4241,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (fg && fg != hwnd) g_target = fg;
                 return 0;
             }
-            // 失焦即收起。这里以前会「抢救」一次前台（ForceForeground 后 return），
-            // 一旦抢救成功就不会再有失焦事件，面板会永久挂在屏幕上——这正是
-            // 「非固定态失焦也不隐藏」的根因。宁可偶尔被别的窗口抢焦点导致早收，
-            // 也不要出现收不起来的状态。
-            g_menuOpen = false;
-            g_modalOpen = false;
-            HidePanel();
+            // 失焦即收起，但不要当场收：抢前台的刹那 explorer 常常先夺回一次前台，
+            // 同步 HidePanel 会把这一次抖动当成唯一的失焦事件，用户看到的就是
+            // 「按了 Win+V，原窗口失焦、面板没出来，得再按一次」。投递到队列排空后复查，
+            // 抖动会自愈；真丢了焦点就照旧收起（见 FocusStillOurs）。
+            PostMessageW(hwnd, WM_APP_DEFER_HIDE, 0, 0);
             return 0;
         }
         return 0;
 
     case WM_APP_DEFER_HIDE:
-        if (g_pinned || g_dialogOpen) return 0;
-        if (GetForegroundWindow() != hwnd) {
+        Trace("WM_APP_DEFER_HIDE fg=%p", (void*)GetForegroundWindow());
+        if (g_pinned || g_dialogOpen || g_dragging) return 0;
+        if (!FocusStillOurs(hwnd)) {
             g_menuOpen = false;
             g_modalOpen = false;
             HidePanel();
@@ -4373,7 +4400,12 @@ static void RoundCorners(HWND hwnd) {
 }
 
 static void HidePanel() {
+    Trace("HidePanel() from %p fg=%p", __builtin_return_address(0), (void*)GetForegroundWindow());
     if (g_panel && IsWindowVisible(g_panel)) {
+        // 面板自己占着前台时收起，必须把焦点还回原窗口。否则前台停在一个不可见的
+        // 窗口上，用户看到的是「原窗口莫名其妙失焦、键盘输入没有任何反应」，
+        // 再按一次 Win+V 才恢复——资源管理器里就是这么表现的。
+        bool hadFocus = (GetForegroundWindow() == g_panel);
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }
         if (g_resizing) { g_resizing = RS_NONE; ReleaseCapture(); }
         KillTimer(g_panel, TIMER_CARET);
@@ -4389,10 +4421,37 @@ static void HidePanel() {
         g_pinned = false;        // 临时固定只在本次显示期间有效，关闭即取消
         g_keepOpen = false;
         BuildView();
+        if (hadFocus && g_target && g_target != g_panel && IsWindow(g_target)) {
+            SetForegroundWindow(g_target);
+            RestoreTargetFocus(g_target, g_targetFocus);
+        }
     }
 }
 
+// ---- 诊断日志（默认关闭，见下方定义）----
+static void Trace(const char* fmt, ...);
+
+static void ForceForeground(HWND hwnd);
+
+// 面板失焦后的统一判据。和早期那版「一失焦就抢回前台」的区别有两条：
+//   1) 只在唤起后的 500ms 内抢，且最多 2 次。那段时间是弹出瞬间 explorer 与前台锁
+//      互相拉扯的窗口，抢回来是对的；过了这个窗口还抢，用户主动切走就会被硬拽回来，
+//      而且抢成功后不会再有 WA_INACTIVE，面板会永久挂在最上面（早期踩过的坑）。
+//   2) 每次判断都重新读一遍前台，抢不回来就老老实实收起，不会卡在“可见但没焦点”的状态。
+static bool FocusStillOurs(HWND hwnd) {
+    HWND fg = GetForegroundWindow();
+    if (fg == hwnd) { g_rescueTries = 0; return true; }
+    if (GetTickCount() - g_shownAt < 500 && g_rescueTries < 2) {
+        g_rescueTries++;
+        Trace("FocusStillOurs: rescue #%d (fg=%p)", g_rescueTries, (void*)fg);
+        ForceForeground(hwnd);
+        return GetForegroundWindow() == hwnd;
+    }
+    return false;
+}
+
 static void ForceForeground(HWND hwnd) {
+    Trace("  ForceForeground(%p) enter fg=%p", (void*)hwnd, (void*)GetForegroundWindow());
     HWND fg = GetForegroundWindow();
     if (fg == hwnd) { SetFocus(hwnd); return; }
     DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
@@ -4421,7 +4480,37 @@ static void ForceForeground(HWND hwnd) {
     }
 }
 
+// 目标窗口内部当前有焦点的控件。
+static HWND FocusOfWindow(HWND wnd) {
+    if (!wnd || !IsWindow(wnd)) return nullptr;
+    DWORD tid = GetWindowThreadProcessId(wnd, nullptr);
+    if (!tid) return nullptr;
+    GUITHREADINFO gi{}; gi.cbSize = sizeof(gi);
+    if (!GetGUIThreadInfo(tid, &gi)) return nullptr;
+    HWND f = gi.hwndFocus;
+    if (!f || !IsWindow(f)) return nullptr;
+    return f;
+}
+
+// 把控件级焦点还回目标窗口。
+// SetForegroundWindow 只还原顶层窗口，窗口内部的焦点由它自己决定要不要恢复：
+// 记事本会，资源管理器的地址栏 / 搜索框不会。不还的话，随后 SendInput 出去的那下
+// Ctrl+V 会打在一个内部无焦点的窗口上——用户看到的就是「面板里选了条目，输入框没反应」。
+static void RestoreTargetFocus(HWND target, HWND focus) {
+    if (!target || !IsWindow(target) || !focus || !IsWindow(focus)) return;
+    if (target == g_panel) return;
+    DWORD tid = GetWindowThreadProcessId(target, nullptr);
+    DWORD myTid = GetCurrentThreadId();
+    if (!tid) return;
+    if (tid == myTid) { SetFocus(focus); return; }
+    AttachThreadInput(myTid, tid, TRUE);
+    SetFocus(focus);
+    AttachThreadInput(myTid, tid, FALSE);
+    Trace("  RestoreTargetFocus: focus=%p -> %p", (void*)focus, (void*)GetFocus());
+}
+
 static void ShowPanel() {
+    Trace("=== ShowPanel enter fg=%p vis=%d", (void*)GetForegroundWindow(), g_panel ? (int)IsWindowVisible(g_panel) : -1);
     g_query.clear(); g_comp.clear();
     g_sel = 0; g_top = 0;
     g_hoverRow = g_hoverChip = g_hoverCell = -1;
@@ -4439,6 +4528,8 @@ static void ShowPanel() {
 
     HWND fg = GetForegroundWindow();
     if (fg && fg != g_panel) g_target = fg;
+    // 必须趁目标窗口还持有焦点时读：抢完前台，它内部的焦点控件已经被清掉了。
+    g_targetFocus = FocusOfWindow(g_target);
 
     // 位置：优先贴着目标窗口的文本插入符弹出；拿不到插入符（桌面、文件列表等
     // 没有文本输入区的地方）就居中于鼠标所在显示器。
@@ -4494,9 +4585,15 @@ static void ShowPanel() {
     if (y < minY) y = minY;
 
     SetWindowPos(g_panel, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    Trace("  after SWP_SHOWWINDOW fg=%p vis=%d", (void*)GetForegroundWindow(), (int)IsWindowVisible(g_panel));
     RoundCorners(g_panel);
     g_shownAt = GetTickCount();
+    g_rescueTries = 0;
     ForceForeground(g_panel);
+    // 前台锁没松开时 ForceForeground 可能失手：这时候面板已经可见却没有焦点，
+    // 150ms 后的轮询就会把它收掉，用户看到的是「按了没反应」。再补抢一次。
+    if (GetForegroundWindow() != g_panel) { g_rescueTries = 1; ForceForeground(g_panel); }
+    Trace("  after ForceForeground fg=%p vis=%d", (void*)GetForegroundWindow(), (int)IsWindowVisible(g_panel));
     // 抢焦点会立刻让目标窗口隐藏插入符，所以影子要在抢完之后画
     if (hasCaret) {
         GhostShowAt(caretRect, ink);
@@ -4534,6 +4631,7 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
             g_vDown = true;
             g_vDownAt = now;
             if (!repeat) {
+                Trace("hook: downV -> toggle (fg=%p vis=%d)", (void*)GetForegroundWindow(), g_panel ? (int)IsWindowVisible(g_panel) : -1);
                 if (g_panel && IsWindowVisible(g_panel)) HidePanel();
                 else ShowPanel();
             }
@@ -4610,6 +4708,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     Redraw();
                     return 0;
                 }
+                // 顶层窗口回来了还不够，地址栏/搜索框那类内部焦点得手动还回去
+                RestoreTargetFocus(target, g_targetFocus);
                 if (!pending.empty()) {
                     TypeUnicode(pending);            // 表情/符号：直插，不动剪贴板
                 } else {

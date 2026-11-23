@@ -88,8 +88,28 @@ if (!repeat) { /* 只有这里才 toggle */ }
 `AttachThreadInput(自己, 前台线程, TRUE)` → `BringWindowToTop` → `SetForegroundWindow` → `SetActiveWindow` → `SetFocus` → 解除 attach；仍失败则注入一次 Alt 抬起兜底。
 
 - **显示面板要同步发生在钩子回调里**，不能 `PostMessage` 绕一圈：本进程刚处理过输入事件时抢前台才可靠，异步延迟几十毫秒经常抢不到。
-- **失焦就收起，不要"抢救"前台**。曾经的做法是：失焦后如果在显示 800ms 内，先 `ForceForeground` 抢回前台而不是隐藏（本意是躲开刚弹出时的前台抖动）。这会造成死锁式状态：抢救成功后窗口重新激活，之后再没有新的失焦事件，面板就永久挂在屏幕最上层——表现为"非固定态失焦也不隐藏"。
-- 现在两条一起用：`WM_ACTIVATE` 的 `WA_INACTIVE` 直接 `HidePanel`（固定态除外）；另外面板显示期间挂一个 150ms 的 `TIMER_FOCUS` 轮询 `GetForegroundWindow()`，因为它不总是送达——实测「靠 `AttachThreadInput` 抢来的前台」有相当概率收不到 `WA_INACTIVE`，只靠事件会漏。轮询在 `HidePanel` 里 `KillTimer`，拖动中（`g_dragging`）跳过判断。
+- **失焦要收起，但不能当场收，也不能一概不收**。这里踩过两次：
+  1. 早期是「失焦后抢救前台」：显示 800ms 内先 `ForceForeground` 抢回来而不是隐藏。抢救成功后窗口重新激活，之后再也没有新的失焦事件，面板就永久挂在最上层——表现为"非固定态失焦也不隐藏"。
+  2. 改成 `WA_INACTIVE` 直接 `HidePanel` 后，资源管理器里出现新问题：抢前台的刹那 explorer 常先夺回一次前台，这条唯一的失焦事件被当场执行，用户看到的就是「按了 Win+V，原窗口失焦、面板没出来，得再按一次」。
+- 现在的做法：`WA_INACTIVE` 只 `PostMessage(WM_APP_DEFER_HIDE)`，等消息队列排空后复查；`FocusStillOurs()` 是唯一判据——唤起后 500ms 内允许重新抢前台（最多 2 次，盖住弹出瞬间的抖动），超过这个窗口就一律收起，不把用户硬拽回来。另有 150ms 的 `TIMER_FOCUS` 轮询兜底，因为「靠 `AttachThreadInput` 抢来的前台」有相当概率收不到 `WA_INACTIVE`。
+- **收起时必须把焦点还回去**。`HidePanel` 里如果发现前台正是面板自己，就 `SetForegroundWindow(g_target)` 再把控件级焦点也还回去。少了这一步，前台会停在一个不可见的窗口上，用户感受是「原窗口莫名失焦、键盘输入完全没反应」。
+
+### 2.5 抢走焦点后，目标窗口里的输入框会"失焦"
+
+面板要拿焦点才能打字搜索，所以唤出时目标窗口必然失焦，这是躲不掉的。真正的问题在粘贴那一步：
+
+`SetForegroundWindow(target)` 只还原**顶层窗口**，窗口内部哪个控件有焦点由它自己决定要不要恢复。记事本会自己找回来，**资源管理器的地址栏 / 搜索框不会**——于是紧接着 `SendInput` 出去的那下 `Ctrl+V` 打在一个内部无焦点的窗口上，什么都没发生。
+
+做法：唤起面板时（趁目标窗口还持有焦点，之后就读不到了）用 `GetGUIThreadInfo().hwndFocus` 记下那个控件，粘贴前 `AttachThreadInput` 跨线程 `SetFocus()` 还回去，再发按键。
+
+对照实测（地址栏里输入 ZZZ → Win+V → Enter 粘第一条 → Ctrl+A/Ctrl+C 读回地址栏）：
+
+| | 地址栏内容 |
+|---|---|
+| 不做控件级焦点恢复 | 3/3 失败，读回 `None` |
+| 做 | 3/3 成功，读回 `PASTEFROMHISTORY` |
+
+关掉面板后继续打字也有同样的问题，所以 `HidePanel` 归还焦点时一并做了这件事。
 
 ### 3. 剪贴板监听：主窗口不能是 message-only
 
@@ -488,9 +508,31 @@ D2D 的 `ID2D1DCRenderTarget` 是**纯软件光栅化**（这也是当初选它�
 | `test_caret.py [窗口标题子串]` | 打印目标窗口插入符矩形、弹出后的面板矩形、影子光标矩形，并给出两者偏差（期望面板左上 = 插入符左下 + `(-2, 8)`，影子与插入符重合） |
 | `test_pinned_ghost.py` | 固定态连点两个表情，打印每步影子光标位置：应逐个右移（每格约 22px），关闭面板后隐藏。**跑之前先把记事本置前**——脚本自己不抢前台（跨进程 `SetForegroundWindow` 常被前台锁拒绝，会静默测到别的窗口上） |
 | `test_explorer_type.py` | 资源管理器（没有文本输入区）里点表情：断言面板不收起、前台不变、`hwndCaret == 0`，且关掉面板后资源管理器能正常拿回焦点 |
+| `test_addrbar.py` | 在资源管理器**地址栏**里 Win+V → Enter 粘第一条，再 `Ctrl+A/Ctrl+C` 读回地址栏内容：验证控件级焦点被还回去了（不还的话读回 `None`） |
+| `test_focus_after_close.py` | 地址栏输入 → Win+V → Esc → 继续输入，读回验证焦点回到地址栏 |
 | `tools/gen_glyph_data.py <数据目录> src` | 从参考页面的 symbols.js / emoji.js 重新生成 `glyph_data.cpp` |
 
 自动化点击面板请用 `PostMessage` 投递 `WM_LBUTTONDOWN/UP`（客户区坐标）：`SendInput` 的鼠标移动不会给窗口送 `WM_MOUSEMOVE`，而真实拖拽又会打断面板。
+
+自动化脚本里跨进程切前台一律先校验 `GetForegroundWindow()`：`SetForegroundWindow` 常被前台锁静默拒绝，不校验就会把操作打到别的窗口上（`test_glyph_insert.py` / `test_pinned_insert.py` 里的 `force_fg()` 就是为此加的）。
+
+### 诊断日志
+
+前台 / 焦点类问题不好靠猜，可以设环境变量 `WV_TRACE=1` 启动，日志写进 `%TEMP%\winvclip-trace.txt`：
+
+```
+hook: downV -> toggle (fg=... vis=0)
+=== ShowPanel enter fg=... vis=0
+  after SWP_SHOWWINDOW fg=... vis=1
+  ForceForeground(...) enter fg=...
+  after ForceForeground fg=... vis=1
+WM_ACTIVATE wp=0 fg=...
+WM_APP_DEFER_HIDE fg=...
+FocusStillOurs: rescue #1 (fg=...)
+HidePanel() from <返回地址> fg=...
+```
+
+默认关闭时只多一次 `getenv`，正常使用的开销可忽略。
 
 ## 卸载/恢复系统行为
 

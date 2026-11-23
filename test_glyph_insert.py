@@ -119,13 +119,36 @@ def edit_text(np):
     return buf.value
 
 
+def force_fg(hwnd):
+    """跨进程 SetForegroundWindow 经常静默失败（还带前台锁），这里强制并校验。"""
+    if u.GetForegroundWindow() == hwnd:
+        return True
+    fg = u.GetForegroundWindow()
+    tid = u.GetWindowThreadProcessId(fg, None)
+    my = k.GetCurrentThreadId()
+    u.AttachThreadInput(my, tid, True)
+    u.BringWindowToTop(hwnd)
+    u.SetForegroundWindow(hwnd)
+    u.SetActiveWindow(hwnd)
+    u.SetFocus(hwnd)
+    u.AttachThreadInput(my, tid, False)
+    for _ in range(8):
+        if u.GetForegroundWindow() == hwnd:
+            return True
+        key(0x12); key(0x12, True)
+        u.SetForegroundWindow(hwnd)
+        time.sleep(0.05)
+    return u.GetForegroundWindow() == hwnd
+
+
 def main():
     proc = subprocess.Popen(["notepad.exe"])
     time.sleep(1.6)
     np = u.FindWindowW(None, "无标题 - 记事本") or u.FindWindowW(None, "Untitled - Notepad")
     if not np:
         raise SystemExit("notepad not found")
-    u.SetForegroundWindow(np)
+    if not force_fg(np):
+        raise SystemExit("无法把记事本切到前台，测试不可信")
     time.sleep(0.3)
 
     h = panel()
