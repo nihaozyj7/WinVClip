@@ -28,6 +28,8 @@ set(WINVCLIP_SOURCES
     src/render/dc.cpp
     src/render/icons.cpp
     src/render/fonts.cpp
+    src/image/raster.cpp
+    src/image/thumb.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
 )
