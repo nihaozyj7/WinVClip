@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "app_state.h"   // GCat / GItem / RecentGlyph 与字形库全局
-#include "model.h"
+#include "core/app_state.h"   // GCat / GItem / RecentGlyph 与字形库全局
+#include "core/model.h"
 
 // ---------------------------------------------------------------- 解析
 // 启动时只解析分类表（不碰几千条条目），条目索引在真正要显示某类时才建。

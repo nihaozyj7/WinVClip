@@ -43,19 +43,19 @@
 #include <condition_variable>
 #include <memory>
 #include <cstring>
-#include "glyph_data.h"
+#include "glyph/glyph_data.h"
 
 // ================================================================== 常量
 // 视觉常量（配色 / 尺寸 / 窗口类名）集中在 theme.h，改配色只看那一个文件。
-#include "theme.h"
+#include "core/theme.h"
 using namespace wv;
-#include "text_util.h"
-#include "diag.h"
-#include "io_png.h"
-#include "model.h"
-#include "app_state.h"
-#include "glyph.h"
-#include "text_measure.h"
+#include "core/text_util.h"
+#include "core/diag.h"
+#include "core/io_png.h"
+#include "core/model.h"
+#include "core/app_state.h"
+#include "glyph/glyph.h"
+#include "core/text_measure.h"
 
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10,
        WM_APP_HIDE_OUTSIDE = WM_APP + 11 };

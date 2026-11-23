@@ -31,7 +31,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 
-#include "model.h"      // ClipItem / GItem / GCat / RecentGlyph
+#include "core/model.h"      // ClipItem / GItem / GCat / RecentGlyph
 
 // ---------------------------------------------------------------- 页面 / 筛选
 enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };

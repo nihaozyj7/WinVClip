@@ -4,14 +4,14 @@
 //   C<TAB>key<TAB>中文名        分类头
 //   I<TAB>字形<TAB>中文名<TAB>英文名   条目（英文名可省）
 // 全流程不为条目分配宽字符串：只在要画到屏幕时才转，见 model.h 的说明。
-#include "glyph.h"
+#include "glyph/glyph.h"
 
 #include <cctype>
 #include <cstring>
 #include <unordered_map>
 
-#include "glyph_data.h"
-#include "text_util.h"
+#include "glyph/glyph_data.h"
+#include "core/text_util.h"
 
 using namespace wv;
 

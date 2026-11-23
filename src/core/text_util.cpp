@@ -1,4 +1,4 @@
-#include "text_util.h"
+#include "core/text_util.h"
 
 #include <cstdio>
 #include <cwctype>

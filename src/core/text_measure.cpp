@@ -1,10 +1,10 @@
 // text_measure.cpp —— 文字度量（说明见 text_measure.h）。
-#include "text_measure.h"
+#include "core/text_measure.h"
 
 #include <cmath>
 #include <unordered_map>
 
-#include "app_state.h"
+#include "core/app_state.h"
 
 IDWriteTextFormat* Fmt(HFONT f) {
     auto it = g_tfmt.find(f);

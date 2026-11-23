@@ -1,4 +1,4 @@
-#include "io_png.h"
+#include "core/io_png.h"
 
 namespace wv {
 
