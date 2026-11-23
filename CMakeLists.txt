@@ -37,6 +37,9 @@ set(WINVCLIP_SOURCES
     src/ui/layout.cpp
     src/ui/paint.cpp
     src/ui/caret.cpp
+    src/ui/actions.cpp
+    src/ui/panel.cpp
+    src/ui/showhide.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
 )
