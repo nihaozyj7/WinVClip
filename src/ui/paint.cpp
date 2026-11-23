@@ -32,28 +32,51 @@
 using namespace wv;
 
 // ================================================================== 绘制
+// 左上、右上为圆角、底部为直角的矩形填充。
+// 页签的形状是 CSS 的 border-radius: 6px 6px 0 0——底部要和内容区连成一片，
+// 所以底角必须保持直角；直接用四角圆角的 FillRound 会在页签下沿露出标题栏底色。
+void FillTopRound(HDC dc, const RECT& r, float rad, COLORREF c) {
+    (void)dc;
+    if (!g_rt || !g_painting) return;
+    if (rad < 0.1f) { FillBox(dc, r, c); return; }
+    float l = (float)r.left, t = (float)r.top, rr = (float)r.right, b = (float)r.bottom;
+    if (rad > (rr - l) / 2.0f) rad = (rr - l) / 2.0f;
+    if (rad > b - t) rad = b - t;
+    const float k = 0.5522847498f * rad;
+    PathB p;
+    if (!p.ok()) { FillBox(dc, r, c); return; }
+    p.MoveFill(l + rad, t);
+    p.Line(rr - rad, t);
+    p.sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(rr - rad + k, t),
+                                          D2D1::Point2F(rr, t + rad - k),
+                                          D2D1::Point2F(rr, t + rad)));
+    p.Line(rr, b);
+    p.Line(l, b);
+    p.Line(l, t + rad);
+    p.sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(l, t + rad - k),
+                                          D2D1::Point2F(l + rad - k, t),
+                                          D2D1::Point2F(l + rad, t)));
+    p.EndClosed();
+    p.Fill(c);
+}
+
 void PaintHead(HDC dc) {
     int headBot = L.head.bottom - 1;
     RECT hb{0, 0, L.W, headBot};
     FillBox(dc, hb, C_SUBTLE);
 
-    // 品牌标
-    FillRound(dc, L.logo, S(7), C_VOLT, C_VOLT, 0);
-    RECT li = L.logo; InflateRect(&li, -S(5), -S(5));
-    DrawIcon(dc, IC_CLIP, li, C_SURFACE, 2.0f);
-
-    // 页签
+    // 页签。活动页签是顶部两角圆、底边与内容区连通的卡片（6px 6px 0 0）：
+    // 圆角连边框一起弯，所以先按边框色铺一层，再内缩 1px 铺底色；底边不内缩，
+    // 底色一直落到底线上，才和下面的内容区接得上。
+    float tabRad = (float)S(6);
     for (int i = 0; i < 4; ++i) {
         RECT t = L.tab[i];
         bool active = (i == g_page);
         RECT rr = t; rr.bottom = headBot;
         if (active) {
-            FillBox(dc, rr, C_SURFACE);
-            // 上边与左右边框
-            HLine(dc, rr.left, rr.right, rr.top, C_LINE);
-            RECT vl{rr.left, rr.top, rr.left + 1, rr.bottom};
-            RECT vr{rr.right - 1, rr.top, rr.right, rr.bottom};
-            FillBox(dc, vl, C_LINE); FillBox(dc, vr, C_LINE);
+            FillTopRound(dc, rr, tabRad, C_LINE);
+            RECT inner{rr.left + 1, rr.top + 1, rr.right - 1, rr.bottom};
+            FillTopRound(dc, inner, tabRad - 1, C_SURFACE);
             // 顶部橙色条（覆盖边框线，与 CSS 的 ::after 一致）
             RECT bar{rr.left + S(12), rr.top, rr.right - S(12), rr.top + S(2)};
             FillBox(dc, bar, C_VOLT);
@@ -87,7 +110,7 @@ void FillTRRound(HDC dc, const RECT& r, float rad, COLORREF c) {
     const float k = 0.5522847498f * rad;
     PathB p;
     if (!p.ok()) { FillBox(dc, r, c); return; }
-    p.Move(l, t);
+    p.MoveFill(l, t);
     p.Line(rr - rad, t);
     p.sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(rr - rad + k, t),
                                           D2D1::Point2F(rr, t + rad - k),

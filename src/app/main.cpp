@@ -43,6 +43,7 @@
 #include <condition_variable>
 #include <memory>
 #include <cstring>
+#include "app/resource.h"
 #include "glyph/glyph_data.h"
 
 // ================================================================== 常量
@@ -218,6 +219,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     wc.cbSize = sizeof(wc);
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    // 两种尺寸各取一次：大图标给 Alt+Tab / 任务栏，小图标给标题栏与托盘，
+    // 都带 LR_SHARED 由系统托管，不必自己 DestroyIcon。
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 0, 0,
+                                LR_DEFAULTSIZE | LR_SHARED);
+    wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                  GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                  LR_SHARED);
     wc.lpfnWndProc = MainProc;
     wc.lpszClassName = MAIN_CLASS;
     RegisterClassExW(&wc);

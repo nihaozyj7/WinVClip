@@ -44,6 +44,15 @@ struct PathB {
         sink->BeginFigure(D2D1::Point2F(x, y), D2D1_FIGURE_BEGIN_HOLLOW);
         used = true;
     }
+
+    // 填充用的起点。BeginFigure 的 filled/hollow 决定该子路径参不参与填充：
+    // 图标是描边的，用 Move（hollow）即可；一旦要 FillGeometry（按钮高亮块、
+    // 页签底色），figure 必须开成 filled，否则路径明明存在却什么都填不出来。
+    void MoveFill(float x, float y) {
+        if (!sink) return;
+        sink->BeginFigure(D2D1::Point2F(x, y), D2D1_FIGURE_BEGIN_FILLED);
+        used = true;
+    }
     void Line(float x, float y) { if (sink) sink->AddLine(D2D1::Point2F(x, y)); }
     void EndOpen()   { if (sink) sink->EndFigure(D2D1_FIGURE_END_OPEN); }
     void EndClosed() { if (sink) sink->EndFigure(D2D1_FIGURE_END_CLOSED); }

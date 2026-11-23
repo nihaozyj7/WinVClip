@@ -1,0 +1,8 @@
+// app.rc.in —— CMake configure_file 的模板（@ONLY）。
+//
+// 两个刻意的写法：
+//   1. ico 用绝对路径：windres 解析 ICON 的相对路径是相对构建目录，不是 .rc 所在目录；
+//   2. 图标 ID 写字面量 101 而不是 IDI_APP：.rc 不参与 C++ 头文件搜索，且这一份资源只
+//      在链接后由 tools/attach_icon.py 贴上（原因见该脚本注释：ld 2.47 合并 icon 会失败）。
+//      数字需与 src/app/resource.h 里的 IDI_APP 保持一致。
+101 ICON "@WINVCLIP_RES_ICO@"

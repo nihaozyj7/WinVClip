@@ -34,22 +34,23 @@ void ComputeLayout() {
     L.W = W; L.H = H;
 
     L.head = {0, 0, W, S(HEAD_H)};
-    L.logo = {S(12), S((HEAD_H - 26) / 2), S(12) + S(26), S((HEAD_H - 26) / 2) + S(26)};
 
     // 右上三个按钮：临时固定 / 设置 / 关闭（与标题栏等高，关闭按钮贴右缘）
     // 先算按钮，页签才知道自己能用多宽
-    int btnW = S(30);
+    // 宽高一致：按钮做成 HEAD_H×HEAD_H 的正方形（原来宽 30、高 34，略扁）
+    int btnW = S(HEAD_H);
     L.closeB = {W - btnW, 0, W, S(HEAD_H)};
     L.gear   = {L.closeB.left - btnW, 0, L.closeB.left, S(HEAD_H)};
     L.pinB   = {L.gear.left - btnW, 0, L.gear.left, S(HEAD_H)};
 
-    // 页签：紧接 logo，右边界顶到固定按钮左侧。
+    // 页签：从左边距起排，右边界顶到固定按钮左侧。
     // 宽度下限压到 360 后四个页签的自然宽度放不下，此时按可用宽度均分，
     // 否则「剪贴板」会顶到图钉按钮底下，或者页签互相压住。
-    int tabGap = S(4);
-    int x0 = S(12) + S(26) + S(10);
+    // 页签彼此紧邻、不留间隔（相邻页签直接共享一条边，活动页签的填充块
+    // 与两侧页签贴齐，不再露出标题栏底色成缝）。
+    int x0 = 0;   // 页签贴着面板左缘起排（原来是 S(12) 左边距）
     int avail = L.pinB.left - S(6) - x0;
-    int nat[4], total = tabGap * 3;
+    int nat[4], total = 0;
     for (int i = 0; i < 4; ++i) {
         nat[i] = TextW(g_fTab, TAB_NAME[i]) + S(20);
         total += nat[i];
@@ -58,14 +59,14 @@ void ComputeLayout() {
     if (total <= avail) {
         for (int i = 0; i < 4; ++i) {
             L.tab[i] = {x, 0, x + nat[i], S(HEAD_H)};
-            x += nat[i] + tabGap;
+            x += nat[i];
         }
     } else {
-        int each = (avail - tabGap * 3) / 4;
+        int each = avail / 4;
         if (each < S(30)) each = S(30);
         for (int i = 0; i < 4; ++i) {
             L.tab[i] = {x, 0, x + each, S(HEAD_H)};
-            x += each + tabGap;
+            x += each;
         }
     }
 

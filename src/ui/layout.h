@@ -26,7 +26,7 @@
 
 struct Layout {
     int W, H;
-    RECT head, logo, tab[4], gear, closeB, pinB;
+    RECT head, tab[4], gear, closeB, pinB;
     RECT searchBox, filters, body, foot;
     RECT chip[8]; int chipCat[8] = {0}; int nChip = 0;
     RECT moreBtn;
