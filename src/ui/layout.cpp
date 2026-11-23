@@ -323,3 +323,33 @@ RECT CenterIcon(const RECT& b, int s) {
     int x = cx - s / 2, y = cy - s / 2;
     return RECT{x, y, x + s, y + s};
 }
+
+void ClampScroll() {
+    ComputeLayout();
+    int fit = L.nRow;
+    if (g_top > 0 && g_sel < g_top) g_top = g_sel;
+    if (g_top + fit <= g_sel) g_top = g_sel - fit + 1;
+    int maxTop = (int)g_view.size() - fit;
+    if (maxTop < 0) maxTop = 0;
+    if (g_top > maxTop) g_top = maxTop;
+    if (g_top < 0) g_top = 0;
+    ComputeLayout();
+}
+
+// 网格页内容总高（表情与符号同一套网格）
+int GridContentH() {
+    if (g_page == PG_EMOJI || g_page == PG_SYMBOL) {
+        int n = GlyphCount(g_page);
+        int rows = (n + GlyphCols() - 1) / GlyphCols();
+        return S(8) + rows * (S(44) + S(5));
+    }
+    return 0;
+}
+
+void ClampGridScroll() {
+    int maxS = GridContentH() - (L.body.bottom - L.body.top) + S(12);
+    if (maxS < 0) maxS = 0;
+    if (g_gridScroll > maxS) g_gridScroll = maxS;
+    if (g_gridScroll < 0) g_gridScroll = 0;
+}
+

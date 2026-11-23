@@ -27,6 +27,3 @@ void MakeFonts();
 // 创建 D2D 工厂、DCRenderTarget、椭圆 trimming sign 等一次性设备对象
 void InitD2D();
 
-// 覆盖度探测用的 DWrite 字体对象：判定某个字形在指定字体里到底画不画得出来。
-// 实现在 glyph 绘制段（它属于「字形可画性」这件事，不属于字体创建）。
-IDWriteFont* MakeProbe(const wchar_t* family);

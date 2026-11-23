@@ -58,6 +58,11 @@ void ClampDrawerScroll();
 int  DrawerHit(POINT p);       // 抽屉内命中的分类下标，-1 = 没命中
 void ToggleDrawer(bool open);
 
+// 滚动范围：把选中项滚进视野、把滚动量夹回合法区间
+void ClampScroll();
+int  GridContentH();
+void ClampGridScroll();
+
 // 字形网格
 int  GlyphCols();
 RECT GlyphCellRect(int idx);

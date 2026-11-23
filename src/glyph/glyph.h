@@ -44,3 +44,7 @@ bool GlyphDrawable(int page, const char* g, int gl);
 bool GlyphFontCovers(IDWriteFont* f, const std::wstring& s);
 // 字体环境变了（DPI/字体替换）时作废可画性缓存。
 void ClearDrawCache();
+
+// 覆盖度探测用的 DWrite 字体对象：判定某个字形在指定字体里到底画不画得出来。
+// （创建在 glyph 里，因为它是「字形可画性」这件事的一半。）
+IDWriteFont* MakeProbe(const wchar_t* family);

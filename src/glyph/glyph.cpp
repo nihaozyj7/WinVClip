@@ -292,3 +292,22 @@ void AddRecentGlyph(int page, const GItem& it) {
     list.insert(list.begin(), std::move(r));
     if (list.size() > 80) list.resize(80);
 }
+
+// 符号字形的字体兜底：Segoe UI Symbol 覆盖不到数学字母、古文字等区块，
+// 所以在候选字体里挑第一个能画的（可画性判定见 GlyphDrawable）。
+IDWriteFont* MakeProbe(const wchar_t* family) {
+    if (!g_dw) return nullptr;
+    IDWriteFontCollection* coll = nullptr;
+    if (FAILED(g_dw->GetSystemFontCollection(&coll, FALSE)) || !coll) return nullptr;
+    UINT32 idx = 0; BOOL exists = FALSE;
+    IDWriteFont* out = nullptr;
+    if (SUCCEEDED(coll->FindFamilyName(family, &idx, &exists)) && exists) {
+        IDWriteFontFamily* fam = nullptr;
+        if (SUCCEEDED(coll->GetFontFamily(idx, &fam)) && fam) {
+            if (FAILED(fam->GetFont(0, &out))) out = nullptr;
+            fam->Release();
+        }
+    }
+    coll->Release();
+    return out;
+}
