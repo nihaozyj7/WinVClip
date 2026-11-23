@@ -46,40 +46,12 @@
 #include "glyph_data.h"
 
 // ================================================================== 常量
-static const wchar_t* MAIN_CLASS  = L"WinVClipMain";
-static const wchar_t* PANEL_CLASS = L"WinVClipPanelUI";
-
-
-// 主题色（对应 CSS 变量）
-static const COLORREF C_CANVAS   = RGB(244, 242, 237);   // --canvas  #F4F2ED
-static const COLORREF C_SURFACE  = RGB(255, 253, 248);   // --surface #FFFDF8
-static const COLORREF C_SUBTLE   = RGB(231, 227, 219);   // --subtle  #E7E3DB
-static const COLORREF C_INK      = RGB(32, 37, 43);      // --ink     #20252B
-static const COLORREF C_MUTED    = RGB(116, 122, 125);   // --muted   #747A7D
-static const COLORREF C_LINE     = RGB(213, 208, 200);   // --line    #D5D0C8
-static const COLORREF C_VOLT     = RGB(255, 107, 53);    // --voltage #FF6B35
-static const COLORREF C_VOLTSOFT = RGB(255, 224, 210);   // --voltage-soft #FFE0D2
-static const COLORREF C_SUCCESS  = RGB(47, 155, 104);    // --success #2F9B68
-static const COLORREF C_DANGER   = RGB(216, 58, 58);     // --danger  #D83A3A
-static const COLORREF C_RINGSOFT = RGB(255, 232, 221);   // 焦点光晕 rgba(255,107,53,.14)
-
-// 尺寸（逻辑像素，按 DPI 缩放）
-static const int P_W         = 560;
-static const int P_H         = 620;
-static const int HEAD_H      = 34;
-static const int SEARCH_TOP  = 12;
-static const int SEARCH_H    = 40;
-static const int SEARCH_PADX = 14;
-static const int SEARCH_BOT  = 10;
-static const int FILTER_H    = 46;
-static const int FOOT_H      = 38;
-static const int ROW_H       = 56;
-static const int RADIUS      = 12;
-// 面板尺寸可调：最小尺寸由「页签 + 三个按钮排得开」和「至少露出两行」定。
-// 宽度下限压到 360 后页签放不下自然宽度，ComputeLayout 里会按可用宽度均分。
-static const int MIN_W       = 360;
-static const int MIN_H       = 340;
-static const int RESIZE_EDGE = 5;     // 边缘可抓取的带宽（px）
+// 视觉常量（配色 / 尺寸 / 窗口类名）集中在 theme.h，改配色只看那一个文件。
+#include "theme.h"
+using namespace wv;
+#include "text_util.h"
+#include "diag.h"
+#include "io_png.h"
 
 // 页面
 enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };
@@ -275,28 +247,10 @@ static IDWriteInlineObject*   g_ellipsis = nullptr;    // 省略号 trimming sig
 static bool                   g_painting = false;      // 是否处于 D2D batch 内
 static std::unordered_map<HFONT, IDWriteTextFormat*> g_tfmt; // HFONT → DWrite 格式
 
-// ------------------------------------------------ 轻量性能探针（底层，供绘制路径使用）
-// WINVCLIP_PERF=1 时把绘制各阶段耗时累加，每 30 帧写一行到 %TEMP%\winvclip_perf.log
-struct PerfAcc {
-    LONGLONG begin = 0, prep = 0, head = 0, body = 0, foot = 0, end = 0, blit = 0, total = 0, maxTotal = 0;
-    int n = 0;
-};
-static bool          g_perfOn = false;
-static PerfAcc       g_perfAcc;
-static LARGE_INTEGER g_perfFreq{};
-
-static LONGLONG PerfNow() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }
-static void Trace(const char* fmt, ...);   // 诊断日志（WV_TRACE=1 时写 %TEMP%\winvclip-trace.txt）
-static double PerfMs(LONGLONG t) {
-    return g_perfFreq.QuadPart ? (double)t * 1000.0 / (double)g_perfFreq.QuadPart : 0.0;
-}
-static void PerfAppend(const char* line);
-
-static void WarmLog(const char* fmt, int a, int b) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), fmt, a, b);
-    PerfAppend(buf);
-}
+// ------------------------------------------------ 性能探针 / 诊断日志
+// 实现在 diag.cpp：PerfAcc / g_perfOn / g_perfFreq / PerfNow / PerfMs /
+// PerfAppend / PerfInit / WarmLog / Trace。汇总输出 PerfFlush 仍在下方，
+// 因为它要连同当前页与表情命中率一起写，属于业务侧的知识。
 
 static std::vector<GCat>    g_symCats, g_emoCats;
 static std::vector<RecentGlyph> g_recentSym, g_recentEmo;
@@ -315,18 +269,7 @@ static int S(int v) { return MulDiv(v, g_dpi, 96); }
 static IDWriteFont* MakeProbe(const wchar_t* family);   // 实现在字形绘制段
 
 // ================================================================== 工具
-static std::wstring Lower(std::wstring s) {
-    for (auto& c : s) c = (wchar_t)towlower(c);
-    return s;
-}
-
-static std::wstring U8N(const char* s, int n) {
-    if (!s || n <= 0) return L"";
-    int w = MultiByteToWideChar(CP_UTF8, 0, s, n, nullptr, 0);
-    std::wstring out(w > 0 ? (size_t)w : 0, L'\0');
-    if (w > 0) MultiByteToWideChar(CP_UTF8, 0, s, n, &out[0], w);
-    return out;
-}
+// 字符串 / 编码转换见 text_util.h（Lower / U8N / NextCp / W2U8 / FileNameOf / StampName）
 
 // ---------------------------------------------------------------- 字形可画性
 // 系统字体画不出来的字形（显示成「方框」）不该占格子，所以在建索引时就剔掉。
@@ -335,17 +278,7 @@ static std::wstring U8N(const char* s, int n) {
 // 一个字形最多测 4 个候选字体，结果按字形缓存，实际只算一次。
 static std::unordered_map<std::string, bool> g_drawCache;
 
-static UINT32 NextCp(const wchar_t* s, int& i, int n) {
-    UINT32 c = (UINT32)(unsigned short)s[i++];
-    if (c >= 0xD800 && c <= 0xDBFF && i < n) {
-        UINT32 lo = (UINT32)(unsigned short)s[i];
-        if (lo >= 0xDC00 && lo <= 0xDFFF) {
-            ++i;
-            return 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
-        }
-    }
-    return c;
-}
+// NextCp（代理对安全取码位）见 text_util.h
 
 static bool ProbeCovers(IDWriteFont* f, const std::wstring& s) {
     if (!f || s.empty()) return false;
@@ -1735,29 +1668,9 @@ static void PrepareEmojiBitmaps() {
 // 蒙版并预乘 alpha —— 预乘之后 DrawBitmap 的 source-over 就能得到平滑圆角，
 // 不需要 D2D 的 layer（DC render target 不支持 PushLayer 的几何遮罩）。
 
-namespace {
+// Rgba 与 WIC 像素格式 GUID 见 io_png.h
 
-struct Rgba { int w = 0, h = 0; std::vector<BYTE> px; };   // BGRA，非预乘
-
-const GUID kClsidWicFactory = {0xcacaf262, 0x9370, 0x4615,
-                               {0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a}};
-const GUID kIidWicFactory   = {0xec5ec8a9, 0xc395, 0x4314,
-                               {0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70}};
-// GUID_WICPixelFormat32bppBGRA / 32bppPBGRA（自己定义，不依赖 uuid 库导出）
-const GUID kWicFmt32BGRA = {0x6fddc324, 0x4e03, 0x4bfe,
-                            {0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f}};
-const GUID kWicFmt32PBGRA = {0x6fddc324, 0x4e03, 0x4bfe,
-                             {0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x10}};
-
-}  // namespace
-
-static IWICImagingFactory* g_wic = nullptr;
-
-static void InitWic() {
-    if (g_wic) return;
-    CoCreateInstance(kClsidWicFactory, nullptr, CLSCTX_INPROC_SERVER,
-                     kIidWicFactory, (void**)&g_wic);
-}
+// g_wic / InitWic 见 io_png.cpp
 
 static bool PngToRgba(const std::vector<BYTE>& png, Rgba& out) {
     InitWic();
@@ -3293,25 +3206,7 @@ static void PaintModal(HDC dc) {
     TextOutF(dc, g_fChip, C_INK, L"取消", cc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
 }
 
-// ------------------------------------------------ 性能探针：落盘
-static void PerfAppend(const char* line) {
-    wchar_t dir[MAX_PATH];
-    if (!GetTempPathW(MAX_PATH, dir)) return;
-    std::wstring f = std::wstring(dir) + L"winvclip_perf.log";
-    if (FILE* fp = _wfopen(f.c_str(), L"a")) {
-        std::fputs(line, fp);
-        std::fclose(fp);
-    }
-}
-static void PerfInit() {
-    // 环境变量在某些 shell 里 start 时不会传递给子进程，所以命令行参数优先
-    const wchar_t* cl = GetCommandLineW();
-    bool on = (GetEnvironmentVariableW(L"WINVCLIP_PERF", nullptr, 0) != 0);
-    if (cl && wcsstr(cl, L"--perf")) on = true;
-    if (!on) return;
-    QueryPerformanceFrequency(&g_perfFreq);
-    g_perfOn = g_perfFreq.QuadPart != 0;
-}
+// PerfAppend / PerfInit 见 diag.cpp；下面是带业务语义的汇总输出。
 static void PerfFlush() {
     if (g_perfAcc.n <= 0) return;
     char buf[512];
@@ -3479,22 +3374,7 @@ static void PaintPanel(HWND hwnd) {
 // ================================================================== 交互
 // ---- 诊断日志（默认关闭）：排查前台/焦点问题时设 WV_TRACE=1 启动，
 // 记录写到 %TEMP%\winvclip-trace.txt。默认路径上只有一次 getenv，开销可忽略。
-static void Trace(const char* fmt, ...) {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("WV_TRACE"); on = (e && *e && *e != '0') ? 1 : 0; }
-    if (!on) return;
-    wchar_t path[MAX_PATH];
-    GetTempPathW(MAX_PATH, path);
-    lstrcatW(path, L"winvclip-trace.txt");
-    FILE* f = nullptr;
-    _wfopen_s(&f, path, L"a");
-    if (!f) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fputc('\n', f);
-    fclose(f);
-}
+// Trace 见 diag.cpp（WV_TRACE=1 时写 %TEMP%\winvclip-trace.txt）
 
 static void HidePanel();
 static bool PanelShouldStay(HWND hwnd);
@@ -3651,74 +3531,11 @@ static int SelItem() {
 // 文本存 UTF-8(BOM) 的 .txt；PNG 条目直接落盘（无损），CF_DIB 经 WIC 重新编码成 PNG；
 // 文件条目复制原件（多个文件时选目标文件夹，重名自动加序号）。
 
-static std::string W2U8(const std::wstring& s) {
-    if (s.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return {};
-    std::string out((size_t)n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
-    return out;
-}
+// W2U8 / FileNameOf / StampName 见 text_util.h
 
-static std::wstring FileNameOf(const std::wstring& p) {
-    size_t s = p.find_last_of(L"\\/");
-    return s == std::wstring::npos ? p : p.substr(s + 1);
-}
+// WriteAllBytes 见 io_png.cpp
 
-static std::wstring StampName(const SYSTEMTIME& t) {
-    wchar_t b[32];
-    swprintf(b, 32, L"%04d%02d%02d_%02d%02d%02d",
-             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    return b;
-}
-
-static bool WriteAllBytes(const std::wstring& path, const void* data, size_t n) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    bool ok = true;
-    const BYTE* p = (const BYTE*)data;
-    while (ok && n > 0) {
-        DWORD chunk = n > (1u << 20) ? (1u << 20) : (DWORD)n;
-        DWORD wr = 0;
-        ok = WriteFile(h, p, chunk, &wr, nullptr) && wr == chunk;
-        p += chunk;
-        n -= chunk;
-    }
-    CloseHandle(h);
-    return ok;
-}
-
-static bool SaveRgbaAsPng(const Rgba& img, const std::wstring& path) {
-    InitWic();
-    if (!g_wic || img.px.empty() || img.w <= 0 || img.h <= 0) return false;
-    IWICStream* st = nullptr;
-    IWICBitmapEncoder* enc = nullptr;
-    IWICBitmapFrameEncode* fr = nullptr;
-    IPropertyBag2* opt = nullptr;
-    bool ok = false;
-    if (SUCCEEDED(g_wic->CreateStream(&st)) &&
-        SUCCEEDED(st->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
-        SUCCEEDED(g_wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
-        SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) &&
-        SUCCEEDED(enc->CreateNewFrame(&fr, &opt)) &&
-        SUCCEEDED(fr->Initialize(opt))) {
-        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-        if (SUCCEEDED(fr->SetSize((UINT)img.w, (UINT)img.h)) &&
-            SUCCEEDED(fr->SetPixelFormat(&fmt)) &&
-            IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA) &&
-            SUCCEEDED(fr->WritePixels((UINT)img.h, (UINT)img.w * 4, (UINT)img.px.size(),
-                                      const_cast<BYTE*>(img.px.data()))) &&
-            SUCCEEDED(fr->Commit()) &&
-            SUCCEEDED(enc->Commit()))
-            ok = true;
-    }
-    if (opt) opt->Release();
-    if (fr) fr->Release();
-    if (enc) enc->Release();
-    if (st) st->Release();
-    return ok;
-}
+// SaveRgbaAsPng 见 io_png.cpp
 
 // 保存对话框：owner 是面板，期间要禁掉「失焦即隐藏」，否则刚弹出就被收起
 static bool PickSavePath(const std::wstring& defName, const wchar_t* filter,
@@ -3754,21 +3571,7 @@ static bool PickSavePath(const std::wstring& defName, const wchar_t* filter,
     return ok != FALSE;
 }
 
-// 目标已存在时自动加 (1)(2)…，避免多文件复制时互相覆盖
-static std::wstring UniquePath(const std::wstring& p) {
-    if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) return p;
-    size_t dot = p.find_last_of(L'.'), sl = p.find_last_of(L"\\/");
-    std::wstring base = p, ext;
-    if (dot != std::wstring::npos && (sl == std::wstring::npos || dot > sl)) {
-        base = p.substr(0, dot);
-        ext  = p.substr(dot);
-    }
-    for (int i = 1; i < 1000; ++i) {
-        std::wstring c = base + L" (" + std::to_wstring(i) + L")" + ext;
-        if (GetFileAttributesW(c.c_str()) == INVALID_FILE_ATTRIBUTES) return c;
-    }
-    return p;
-}
+// UniquePath 见 io_png.cpp
 
 static void SaveItemAs(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return;
