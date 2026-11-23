@@ -30,6 +30,9 @@ set(WINVCLIP_SOURCES
     src/render/fonts.cpp
     src/image/raster.cpp
     src/image/thumb.cpp
+    src/glyph/emoji_atlas.cpp
+    src/clipboard/capture.cpp
+    src/clipboard/paste.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
 )

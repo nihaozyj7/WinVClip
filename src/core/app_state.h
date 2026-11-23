@@ -33,6 +33,15 @@
 
 #include "core/model.h"      // ClipItem / GItem / GCat / RecentGlyph
 
+// ---------------------------------------------------------------- 应用级消息 / 定时器
+// WM_APP 段的自定义消息与 SetTimer 的定时器 id。放在这里而不是 main.cpp，
+// 因为后台模块（emoji 图集、剪贴板采集）也要用它们排自己的重绘/延迟。
+enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10,
+       WM_APP_HIDE_OUTSIDE = WM_APP + 11 };
+enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
+       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108, TIMER_CLIPRESTORE = 0x109,
+       TIMER_REPROBE = 0x10A, TIMER_DEFERHIDE = 0x10B };
+
 // ---------------------------------------------------------------- 页面 / 筛选
 enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };
 enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
