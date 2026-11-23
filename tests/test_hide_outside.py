@@ -15,150 +15,9 @@
 
 用法：python test_hide_outside.py
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, subprocess, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-k32 = ctypes.windll.kernel32
-u.SetProcessDPIAware()
-
-PANEL_CLASS = "WinVClipPanelUI"
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
-                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
-                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
-                ("rcCaret", wintypes.RECT)]
-
-
-def key(vk, up=False):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def win_vi():
-    key(0x5B); time.sleep(0.05)
-    key(0x56); time.sleep(0.05)
-    key(0x56, True); time.sleep(0.05)
-    key(0x5B, True)
-
-
-def click(x, y, btn_down=0x0002, btn_up=0x0004):
-    u.SetCursorPos(int(x), int(y))
-    time.sleep(0.08)
-    u.mouse_event(btn_down, 0, 0, 0, 0)
-    time.sleep(0.05)
-    u.mouse_event(btn_up, 0, 0, 0, 0)
-
-
-def rect(h):
-    r = wintypes.RECT(); u.GetWindowRect(h, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256)
-    u.GetClassNameW(h, b, 256)
-    return b.value
-
-
-def find_class(name):
-    res = []
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(h, l):
-        if u.IsWindowVisible(h) and cls(h) == name:
-            res.append(h)
-        return True
-    u.EnumWindows(cb, 0)
-    return res
-
-
-def find_title(sub):
-    res = []
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(h, l):
-        if not u.IsWindowVisible(h):
-            return True
-        n = u.GetWindowTextLengthW(h)
-        if n:
-            b = ctypes.create_unicode_buffer(n + 1)
-            u.GetWindowTextW(h, b, n + 1)
-            if sub.lower() in b.value.lower():
-                res.append(h)
-        return True
-    u.EnumWindows(cb, 0)
-    return res
-
-
-def fg():
-    return u.GetForegroundWindow()
-
-
-def caret_of(hwnd):
-    tid = u.GetWindowThreadProcessId(hwnd, None)
-    gi = GUITHREADINFO(); gi.cbSize = ctypes.sizeof(gi)
-    if not u.GetGUIThreadInfo(tid, ctypes.byref(gi)):
-        return None
-    if not gi.hwndCaret:
-        return None
-    return (gi.rcCaret.left, gi.rcCaret.top)
-
-
-def force_fg(hwnd):
-    if fg() == hwnd:
-        return True
-    t1 = u.GetWindowThreadProcessId(fg(), None)
-    t2 = u.GetWindowThreadProcessId(hwnd, None)
-    my = k32.GetCurrentThreadId()
-    for _ in range(8):
-        u.AttachThreadInput(my, t1, True)
-        u.AttachThreadInput(my, t2, True)
-        u.SetForegroundWindow(hwnd)
-        u.AttachThreadInput(my, t1, False)
-        u.AttachThreadInput(my, t2, False)
-        time.sleep(0.1)
-        if fg() == hwnd:
-            return True
-    return False
-
-
-def vis(h):
-    return bool(h) and bool(u.IsWindowVisible(h))
-
-
-def panel():
-    ps = find_class(PANEL_CLASS)
-    return ps[0] if ps else None
-
-
-def wait_panel(show=True, timeout=2.0):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        p = panel()
-        if (vis(p)) == show:
-            return p
-        time.sleep(0.05)
-    return panel() if show else None
-
-
-def inside(pr, x, y):
-    return pr[0] <= x < pr[2] and pr[1] <= y < pr[3]
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def pick_outside_point(pr, note_r, target):
@@ -227,7 +86,7 @@ def main():
         print("记事本没有置顶（点在 0x%X root=0x%X）" % (at or 0, root or 0)); return 1
     # 让记事本里确实有插入符
     u.SendMessageW(hw, 0x000D, 0, 0)
-    click(cr[0] + 60, cr[1] + 60)
+    real_click(cr[0] + 60, cr[1] + 60)
     time.sleep(0.3)
     pre_caret = caret_of(hw)
     print("caret before = %s" % (pre_caret,))
@@ -236,7 +95,7 @@ def main():
         # ---------------- A 非激活态：点目标窗口（前台不变）
         print("\nA 非激活态点目标窗口（前台不变）")
         ensure_hidden(panel())
-        win_vi(); time.sleep(0.7)
+        win_v(); time.sleep(0.7)
         p = wait_panel(True)
         check("面板已弹出", vis(p))
         check("唤起后前台仍是记事本", fg() == hw, "fg=0x%X" % fg())
@@ -245,7 +104,7 @@ def main():
         pt = pick_outside_point(pr, rect(hw), hw)
         check("找到面板外的可点位置", pt is not None, str(pt))
         if pt:
-            click(pt[0], pt[1])
+            real_click(pt[0], pt[1])
             time.sleep(0.5)
             check("点面板外后已收起", not vis(p))
             check("记事本仍是前台", fg() == hw,
@@ -255,11 +114,11 @@ def main():
         # ---------------- B 点面板内部
         print("\nB 点面板内部不收起")
         ensure_hidden(panel())
-        win_vi(); time.sleep(0.7)
+        win_v(); time.sleep(0.7)
         p = wait_panel(True)
         pr = rect(p)
         # 分类条：y ∈ [HEAD_H+SEARCH_TOP+SEARCH_H+SEARCH_BOT, +FILTER_H] = [96,142]
-        click(pr[0] + 30, pr[1] + 118)
+        real_click(pr[0] + 30, pr[1] + 118)
         time.sleep(0.4)
         check("点面板内仍可见", vis(p))
         u.keybd_event(0x1B, 0, 0, 0); time.sleep(0.05)
@@ -274,11 +133,11 @@ def main():
         time.sleep(2.0)
         wins = [h for h in find_title("") if h not in before and cls(h) != PANEL_CLASS]
         force_fg(hw); time.sleep(0.3)
-        win_vi(); time.sleep(0.7)
+        win_v(); time.sleep(0.7)
         p = wait_panel(True)
         pr = rect(p)
         # 搜索框：y ∈ [HEAD_H+SEARCH_TOP, +SEARCH_H] = [46,86]
-        click(pr[0] + 40, pr[1] + 66)
+        real_click(pr[0] + 40, pr[1] + 66)
         time.sleep(0.5)
         input_mode = (fg() == p)
         print("  输入态 = %s (fg=0x%X)" % (input_mode, fg()))
@@ -295,7 +154,7 @@ def main():
             at = u.WindowFromPoint(wintypes.POINT(x, y))
             root = u.GetAncestor(at, 2) if at else None
             print("  other rect = %s  点在 0x%X (root 0x%X)" % (nr, at or 0, root or 0))
-            click(x, y)
+            real_click(x, y)
             time.sleep(0.8)
             check("点别的窗口后面板收起", not vis(p))
             check("用户点的窗口拿到前台", fg() == other,
@@ -310,7 +169,7 @@ def main():
         # 不存在，这里退化为检查「点面板矩形外但属于本进程」的判据不误报：静默跳过）
         print("\nD 拖拽标题栏移动面板不应收起")
         ensure_hidden(panel())
-        win_vi(); time.sleep(0.7)
+        win_v(); time.sleep(0.7)
         p = wait_panel(True)
         pr = rect(p)
         # 按住标题栏拖到右边一点再松开
@@ -325,18 +184,18 @@ def main():
         # ---------------- E 固定态点外部不收起
         print("\nE 固定态点外部不收起")
         ensure_hidden(panel())
-        win_vi(); time.sleep(0.7)
+        win_v(); time.sleep(0.7)
         p = wait_panel(True)
         pr = rect(p)
         pin_x = pr[2] - 75          # 右上三个按钮 = 图钉/齿轮/关闭，各 30 宽
-        click(pin_x, pr[1] + 17)
+        real_click(pin_x, pr[1] + 17)
         time.sleep(0.4)
         pt = pick_outside_point(pr, rect(hw), hw)
         check("找到面板外可点位置", pt is not None, str(pt))
         if pt:
-            click(pt[0], pt[1]); time.sleep(0.5)
+            real_click(pt[0], pt[1]); time.sleep(0.5)
             check("固定态点外部仍可见", vis(p))
-        click(pin_x, pr[1] + 17)     # 取消固定
+        real_click(pin_x, pr[1] + 17)     # 取消固定
         time.sleep(0.3)
         u.keybd_event(0x1B, 0, 0, 0); u.keybd_event(0x1B, 0, 2, 0); time.sleep(0.4)
         check("取消固定后 Esc 收起", not vis(p))

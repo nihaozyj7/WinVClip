@@ -2,41 +2,9 @@
 """验证：在资源管理器地址栏里唤出面板并粘贴，内容要真的进到地址栏。
 步骤：地址栏输入 ZZZ -> Win+V -> Enter 粘第一条 -> Ctrl+A/Ctrl+C 读回地址栏文本。
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, subprocess, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-k = ctypes.windll.kernel32
-u.FindWindowW.restype = ctypes.c_void_p
-u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-u.IsWindowVisible.argtypes = [ctypes.c_void_p]
-u.GetForegroundWindow.restype = ctypes.c_void_p
-u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-u.OpenClipboard.argtypes = [ctypes.c_void_p]
-u.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-u.GetClipboardData.restype = ctypes.c_void_p
-k.GlobalLock.restype = ctypes.c_void_p
-k.GlobalAlloc.restype = ctypes.c_void_p
-k.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-k.GlobalLock.argtypes = [ctypes.c_void_p]
-k.GlobalUnlock.argtypes = [ctypes.c_void_p]
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 class G(ctypes.Structure):
@@ -45,72 +13,6 @@ class G(ctypes.Structure):
                 ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
                 ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
                 ("rcCaret", wintypes.RECT)]
-
-
-def key(vk, up=False):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def uni(ch):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = 0; i.u.ki.wScan = ord(ch)
-    i.u.ki.dwFlags = 0x0004                     # KEYEVENTF_UNICODE
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-    i = INPUT(); i.type = 1; i.u.ki.wVk = 0; i.u.ki.wScan = ord(ch)
-    i.u.ki.dwFlags = 0x0004 | 0x0002
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def combo(mod, vk):
-    key(mod); time.sleep(0.03); key(vk); time.sleep(0.03)
-    key(vk, True); time.sleep(0.03); key(mod, True)
-
-
-def winv():
-    key(0x5B); time.sleep(0.03); key(0x56); time.sleep(0.03)
-    key(0x56, True); time.sleep(0.03); key(0x5B, True)
-
-
-def set_clip(text):
-    u.OpenClipboard(None)
-    u.EmptyClipboard()
-    n = (len(text) + 1) * 2
-    h = k.GlobalAlloc(0x0042, n)
-    p = k.GlobalLock(h)
-    ctypes.memmove(p, text.encode("utf-16-le") + b"\0\0", n)
-    k.GlobalUnlock(h)
-    u.SetClipboardData(13, h)
-    u.CloseClipboard()
-
-
-def get_clip():
-    if not u.OpenClipboard(None):
-        return None
-    try:
-        h = u.GetClipboardData(13)
-        if not h:
-            return None
-        p = k.GlobalLock(h)
-        try:
-            return ctypes.wstring_at(p)
-        finally:
-            k.GlobalUnlock(h)
-    finally:
-        u.CloseClipboard()
-
-
-def focus_of(hwnd):
-    tid = u.GetWindowThreadProcessId(hwnd, None)
-    g = G(); g.cbSize = ctypes.sizeof(g)
-    u.GetGUIThreadInfo(tid, ctypes.byref(g))
-    return g.hwndFocus
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256)
-    u.GetClassNameW(h, b, 256)
-    return b.value
 
 
 def main():
@@ -126,7 +28,7 @@ def main():
     if not panel:
         raise SystemExit("start winvclip.exe first")
     if u.IsWindowVisible(panel):
-        winv(); time.sleep(0.4)
+        win_v(); time.sleep(0.4)
 
     payload = "PASTEFROMHISTORY"
     set_clip(payload)
@@ -152,7 +54,7 @@ def main():
         time.sleep(0.3)
         print("round %d: 地址栏 focus=0x%X (%s), 输入 ZZZ" % (rnd, f0 or 0, cls(f0 or 0)))
 
-        winv()
+        win_v()
         time.sleep(0.8)
         vis = bool(u.IsWindowVisible(panel))
         if not vis:
@@ -177,7 +79,7 @@ def main():
         set_clip(payload)
         time.sleep(0.6)
         if u.IsWindowVisible(panel):
-            winv(); time.sleep(0.3)
+            win_v(); time.sleep(0.3)
     print("ALL OK" if ok_all else "有失败")
 
 

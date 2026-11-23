@@ -5,55 +5,9 @@
 纹丝不动，旧的轮询判据永远看不到变化，面板会僵在屏幕上。这里验证新加的低级
 鼠标钩子通道真的把它收起来了，而且这次点击照常送到网页、浏览器仍是前台。
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, subprocess, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-u.SetProcessDPIAware()
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-
-def key(vk, up=False):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def win_vi():
-    key(0x5B); time.sleep(0.05)
-    key(0x56); time.sleep(0.05)
-    key(0x56, True); time.sleep(0.05)
-    key(0x5B, True)
-
-
-def click(x, y):
-    u.SetCursorPos(int(x), int(y)); time.sleep(0.08)
-    u.mouse_event(0x0002, 0, 0, 0, 0); time.sleep(0.05)
-    u.mouse_event(0x0004, 0, 0, 0, 0)
-
-
-def rect(h):
-    r = wintypes.RECT(); u.GetWindowRect(h, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256)
-    u.GetClassNameW(h, b, 256)
-    return b.value
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def find_panel():
@@ -67,35 +21,21 @@ def find_panel():
     return res[0] if res else None
 
 
-def fg():
-    return u.GetForegroundWindow()
+def find_edge():
+    """动态找 Edge 主窗口。
 
-
-def force_fg(hwnd):
-    if fg() == hwnd:
-        return True
-    fg0 = fg()
-    t1 = u.GetWindowThreadProcessId(fg0, None)
-    t2 = u.GetWindowThreadProcessId(hwnd, None)
-    my = ctypes.windll.kernel32.GetCurrentThreadId()
-    for _ in range(8):
-        u.AttachThreadInput(my, t1, True); u.AttachThreadInput(my, t2, True)
-        u.SetForegroundWindow(hwnd)
-        u.AttachThreadInput(my, t1, False); u.AttachThreadInput(my, t2, False)
-        time.sleep(0.1)
-        if fg() == hwnd:
-            return True
-    return False
-
-
-def inside(r, x, y):
-    return r[0] <= x < r[2] and r[1] <= y < r[3]
+    原先这里写死了作者机器上的 hwnd（0x0094049C），换个机器/重启浏览器
+    用例必然失败，还会被误读成"面板回归"。按类名 + 进程名查找才可复现。
+    """
+    hits = find_windows(lambda h, c, t: c == "Chrome_WidgetWin_1"
+                        and exe_path(h).lower().endswith("msedge.exe"))
+    return hits[0] if hits else None
 
 
 def main():
-    edge = 0x0094049C
-    if not u.IsWindow(edge):
-        print("Edge 窗口不在，先跑一次再试"); return 1
+    edge = find_edge()
+    if not edge:
+        print("Edge 窗口不在，先开一个 Edge 窗口再跑"); return 1
     proc = subprocess.Popen(["build\\winvclip.exe"])
     time.sleep(1.2)
     if not force_fg(edge):
@@ -105,12 +45,12 @@ def main():
     fails = []
     # 先点一下网页正文，让页面里有焦点（也是用户实际的用法）
     er = rect(edge)
-    click(int((er[0] + er[2]) / 2), int((er[1] + er[3]) / 2))
+    real_click(int((er[0] + er[2]) / 2), int((er[1] + er[3]) / 2))
     time.sleep(0.5)
     if fg() != edge:
         print("Edge 未持有前台(0x%X)" % fg()); return 1
 
-    win_vi(); time.sleep(0.8)
+    win_v(); time.sleep(0.8)
     p = find_panel()
     if not u.IsWindowVisible(p or 0):
         print("面板没弹出"); return 1
@@ -133,7 +73,7 @@ def main():
     if not pt:
         print("找不到可点的网页区域"); proc.terminate(); return 1
 
-    click(pt[0], pt[1])
+    real_click(pt[0], pt[1])
     time.sleep(0.6)
     ok_hide = not u.IsWindowVisible(p)
     ok_fg = (fg() == edge)
@@ -143,7 +83,7 @@ def main():
     if not ok_fg: fails.append("Edge 失去前台")
 
     # 再验一次「点击真的送到了网页」：面板收起后再按一次 Win+V，面板应能再次弹出
-    win_vi(); time.sleep(0.8)
+    win_v(); time.sleep(0.8)
     p2 = find_panel()
     ok_again = bool(u.IsWindowVisible(p2 or 0))
     print("  %s 收起后能再次唤起" % ("OK  " if ok_again else "FAIL"))

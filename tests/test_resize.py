@@ -5,60 +5,9 @@
   python test_resize.py state
   python test_resize.py reset     # 删掉记忆文件（下次启动回到默认尺寸）
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, os, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-u.FindWindowW.restype = ctypes.c_void_p
-u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
-u.IsWindowVisible.argtypes = [ctypes.c_void_p]
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-
-def key(vk, up=False):
-    i = INPUT()
-    i.type = 1
-    i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def winv():
-    key(0x5B); time.sleep(0.05); key(0x56); time.sleep(0.05)
-    key(0x56, True); time.sleep(0.05); key(0x5B, True)
-
-
-def panel():
-    for _ in range(60):
-        h = u.FindWindowW("WinVClipPanelUI", None)
-        if h:
-            return h
-        time.sleep(0.05)
-    raise SystemExit("panel not created")
-
-
-def rect(h):
-    r = wintypes.RECT()
-    u.GetWindowRect(h, ctypes.byref(r))
-    return r
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def post(h, msg, x, y, wp=0):
@@ -85,7 +34,7 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "state"
     h = panel()
     if not u.IsWindowVisible(h):
-        winv(); time.sleep(0.6)
+        win_v(); time.sleep(0.6)
 
     if cmd == "state":
         r = rect(h)

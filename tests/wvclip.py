@@ -59,13 +59,14 @@ u.SetProcessDPIAware()
 # --------------------------------------------------------------------------
 PANEL_CLASS = "WinVClipPanelUI"
 
-VK = dict(
-    win=0x5B, v=0x56, esc=0x1B, enter=0x0D, tab=0x09, space=0x20,
-    up=0x26, down=0x28, left=0x25, right=0x27,
-    shift=0x10, ctrl=0x11, alt=0x12,
-    a=0x41, c=0x43, d=0x44, v_key=0x56, x=0x58, z=0x5A, f=0x46,
-    back=0x08, del=0x2E, home=0x24, end=0x23, pgup=0x21, pgdn=0x22,
-)
+VK = {
+    "win": 0x5B, "v": 0x56, "esc": 0x1B, "enter": 0x0D, "tab": 0x09, "space": 0x20,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "shift": 0x10, "ctrl": 0x11, "alt": 0x12,
+    "a": 0x41, "c": 0x43, "d": 0x44, "x": 0x58, "z": 0x5A, "f": 0x46,
+    "back": 0x08, "del": 0x2E, "home": 0x24, "end": 0x23,
+    "pgup": 0x21, "pgdn": 0x22,
+}
 
 CF_UNICODETEXT = 13
 CF_HDROP = 15
@@ -196,8 +197,16 @@ def _send(inp):
     u.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def key(vk, up=False):
-    """按下一个虚拟键（up=True 抬起）。"""
+def key(vk, up=False, uni=None):
+    """按下一个虚拟键（up=True 抬起）。
+
+    uni= 是历史调用形态（`key(0, uni="A")`），等价于 key_uni。
+    保留它是为了让旧用例逐字不改——注入语义存在两种写法时，
+    统一命名带来的收益远小于改错调用点的风险。
+    """
+    if uni is not None:
+        key_uni(uni, up)
+        return
     i = INPUT()
     i.type = 1
     i.u.ki.wVk = vk
@@ -332,15 +341,35 @@ def title(h):
     return b.value
 
 
+class Rect(tuple):
+    """窗口矩形。
+
+    既支持 `l, t, r, b = rect(h)` 解包 / `r[0]` 索引，也支持 `r.left` 属性访问。
+    历史脚本两种写法都有（有的按属性读，有的按索引读），统一成一种会无谓
+    地改到十几个调用点，而这类改动最容易引入"看起来对、算错了"的错误。
+    """
+    __slots__ = ()
+
+    def __new__(cls, l, t, r, b):
+        return super().__new__(cls, (l, t, r, b))
+
+    left = property(lambda s: s[0])
+    top = property(lambda s: s[1])
+    right = property(lambda s: s[2])
+    bottom = property(lambda s: s[3])
+    w = property(lambda s: s[2] - s[0])
+    h = property(lambda s: s[3] - s[1])
+
+
 def rect(h):
     r = wintypes.RECT()
     u.GetWindowRect(h, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
+    return Rect(r.left, r.top, r.right, r.bottom)
 
 
 def size(h):
-    l, t, r, b = rect(h)
-    return (r - l, b - t)
+    r = rect(h)
+    return (r.w, r.h)
 
 
 def fg():
@@ -401,7 +430,16 @@ def find_class(name, visible_only=True):
 
 
 def find_title(sub, visible_only=True):
-    """按标题子串查窗口（不区分大小写）。返回 [(hwnd, title), ...]。"""
+    """按标题子串查窗口，返回 [hwnd, ...]（不区分大小写）。
+
+    空串表示"所有有标题的可见窗口"。多数用例只用 hwnd，所以主签名返回
+    hwnd 列表；需要标题文本时用 find_title_ex。
+    """
+    return [h for h, _t in find_title_ex(sub, visible_only)]
+
+
+def find_title_ex(sub, visible_only=True):
+    """同 find_title，但返回 [(hwnd, title), ...]。"""
     out = []
     sub = sub.lower()
 
@@ -480,10 +518,19 @@ def vis(h):
     return bool(h) and bool(u.IsWindowVisible(h))
 
 
-def inside(h, x, y):
-    """屏幕坐标点是否在窗口矩形内。"""
-    l, t, r, b = rect(h)
-    return l <= x < r and t <= y < b
+def inside(r, x, y):
+    """点是否落在矩形内。
+
+    r 是矩形（Rect/tuple），**不是窗口句柄**——历史用例一律这么调，
+    句柄版本见 inside_win。参数含义搞反时 ctypes 会在 GetWindowRect
+    处抛 ArgumentError，所以两种用法必须分开命名。
+    """
+    return r[0] <= x < r[2] and r[1] <= y < r[3]
+
+
+def inside_win(h, x, y):
+    """点是否落在窗口矩形内（屏幕坐标）。"""
+    return inside(rect(h), x, y)
 
 
 def client_origin(h):
@@ -708,7 +755,7 @@ __all__ = [
     "WM_MOUSEMOVE", "WM_LBUTTONDOWN", "WM_LBUTTONUP",
     "WM_RBUTTONDOWN", "WM_RBUTTONUP", "WM_GETTEXT", "WM_GETTEXTLENGTH",
     # 结构
-    "KEYBDINPUT", "MOUSEINPUT", "INPUT", "GUITHREADINFO", "HWND", "ENUMPROC",
+    "KEYBDINPUT", "MOUSEINPUT", "INPUT", "GUITHREADINFO", "HWND", "ENUMPROC", "Rect",
     # 键鼠
     "key", "key_down", "key_up", "key_uni", "tap", "uni", "combo", "win_v",
     "winv", "win_vi",
@@ -717,8 +764,9 @@ __all__ = [
     "set_clip", "get_clip", "clip_seq",
     # 窗口
     "cls", "title", "rect", "size", "fg", "fg_desc", "force_fg",
-    "find_class", "find_title", "find_windows", "child_windows",
-    "find_notepad", "panel", "wait_panel", "vis", "inside", "client_origin",
+    "find_class", "find_title", "find_title_ex", "find_windows", "child_windows",
+    "find_notepad", "panel", "wait_panel", "vis", "inside", "inside_win",
+    "client_origin",
     # 控件
     "caret_of", "text_of", "edit_of", "edit_text", "focus_of",
     # 进程

@@ -25,12 +25,15 @@ DROP_FUNCS = {
     "key", "tap", "winv", "win_vi", "panel", "vis", "click",
     "set_clip", "get_clip", "cls", "rect", "find_title", "find_class",
     "force_fg", "fg", "inside", "caret_of", "text_of", "edit_text",
-    "find_notepad", "uni", "combo", "find", "focus_of", "size",
+    "find_notepad", "uni", "combo", "find", "focus_of", "size", "wait_panel",
 }
 DROP_CLASSES = {"KEYBDINPUT", "_I", "INPUT", "GUITHREADINFO", "MOUSEINPUT"}
 
 # 这些赋值会遮蔽公共层里已经正确声明过 argtypes 的句柄（ctypes.windll 版本没有声明）
 SHADOW_NAMES = {"u", "U", "k", "k32"}
+# 公共层已导出的模块，脚本里重复 import 是纯噪音
+PUBLIC_MODULES = {"os", "sys", "time", "ctypes", "subprocess", "wintypes"}
+PUBLIC_ALIASES = {"_os", "_sys"}
 
 HEADER = (
     "import wvclip as w\n"
@@ -74,15 +77,34 @@ def plan(lines, tree):
                 kill |= set(span(node))
         elif isinstance(node, ast.Assign):
             names = {t.id for t in node.targets if isinstance(t, ast.Name)}
-            if names & (DROP_FUNCS | {"VK", "PANEL_CLASS"}):
+            if names & {"VK", "PANEL_CLASS"}:
                 kill |= set(span(node))
             elif names & SHADOW_NAMES:
                 src = ast.get_source_segment("\n".join(lines), node.value) or ""
                 if "windll" in src or "WinDLL" in src:
                     kill |= set(span(node))
+            else:
+                # u.FindWindowW.restype = ... / k.GlobalAlloc.argtypes = ...
+                # 公共层导入时已完整声明，脚本里再声明一遍只会让"谁是准的"变模糊
+                for t in node.targets:
+                    if isinstance(t, ast.Attribute) and t.attr in ("restype", "argtypes"):
+                        base = t.value
+                        while isinstance(base, ast.Attribute):
+                            base = base.value
+                        if isinstance(base, ast.Name) and base.id in SHADOW_NAMES:
+                            kill |= set(span(node))
+                            break
         elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             src = ast.get_source_segment("\n".join(lines), node.value) or ""
-            if "SetProcessDPIAware" in src:
+            if "SetProcessDPIAware" in src or "_os.chdir(" in src:
+                kill |= set(span(node))
+        elif isinstance(node, ast.Import):
+            if all(a.name in PUBLIC_MODULES or a.asname in PUBLIC_ALIASES
+                   for a in node.names):
+                kill |= set(span(node))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module in ("ctypes",) and all(
+                    a.name in PUBLIC_MODULES for a in node.names):
                 kill |= set(span(node))
 
     # `# --- 路径基准` 注释块 + 紧跟的 chdir 赋值
@@ -136,12 +158,15 @@ def process(path):
     src = "\n".join(kept)
     src = rewrite(src, click_arity, has_find)
 
-    # 插入公共层导入：docstring 之后
+    # 插入公共层导入：docstring 之后（已有则跳过，工具可重复运行）
     tree2 = ast.parse(src)
-    pos = find_docstring_end(tree2)
-    lines2 = src.split("\n")
-    out = lines2[:pos] + ["", HEADER.rstrip("\n")] + lines2[pos:]
-    out = collapse_blank(out)
+    if "import wvclip as w" in src:
+        out = collapse_blank(src.split("\n"))
+    else:
+        pos = find_docstring_end(tree2)
+        lines2 = src.split("\n")
+        out = lines2[:pos] + ["", HEADER.rstrip("\n")] + lines2[pos:]
+        out = collapse_blank(out)
     src = "\n".join(out)
 
     # 校验：必须仍能解析，且不再有被删定义

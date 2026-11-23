@@ -8,135 +8,14 @@
 
 用法：python test_noactivate.py [目标窗口标题子串]
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-u.SetProcessDPIAware()
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
-                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
-                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
-                ("rcCaret", wintypes.RECT)]
-
-VK = dict(win=0x5B, v=0x56, esc=0x1B, enter=0x0D, down=0x28, up=0x26, a=0x41)
-
-
-def key(vk, up=False, uni=None):
-    if uni is not None:
-        i = INPUT(); i.type = 1
-        i.u.ki.wScan = ord(uni)
-        i.u.ki.dwFlags = 4 | (2 if up else 0)
-        u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-        return
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def tap(vk, n=1):
-    for _ in range(n):
-        key(vk); time.sleep(0.03); key(vk, True); time.sleep(0.03)
-
-
-def win_vi():
-    key(VK["win"]); time.sleep(0.05)
-    key(VK["v"]); time.sleep(0.05)
-    key(VK["v"], True); time.sleep(0.05)
-    key(VK["win"], True)
-
-
-def find(title_sub):
-    res = []
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(h, l):
-        if not u.IsWindowVisible(h):
-            return True
-        n = u.GetWindowTextLengthW(h)
-        if n:
-            b = ctypes.create_unicode_buffer(n + 1)
-            u.GetWindowTextW(h, b, n + 1)
-            if title_sub.lower() in b.value.lower():
-                res.append((h, b.value))
-        return True
-    u.EnumWindows(cb, 0)
-    return res
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256)
-    u.GetClassNameW(h, b, 256)
-    return b.value
-
-
-def caret_of(hwnd):
-    tid = u.GetWindowThreadProcessId(hwnd, None)
-    gi = GUITHREADINFO(); gi.cbSize = ctypes.sizeof(gi)
-    if not u.GetGUIThreadInfo(tid, ctypes.byref(gi)):
-        return None
-    if not gi.hwndCaret:
-        return None
-    return (gi.rcCaret.left, gi.rcCaret.top, gi.rcCaret.right, gi.rcCaret.bottom)
-
-
-def rect(h):
-    r = wintypes.RECT(); u.GetWindowRect(h, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
-
-
-def text_of(h):
-    n = u.SendMessageW(h, 0x000E, 0, 0)          # WM_GETTEXTLENGTH
-    buf = ctypes.create_unicode_buffer(n + 2)
-    u.SendMessageW(h, 0x000D, n + 1, ctypes.byref(buf))   # WM_GETTEXT
-    return buf.value
-
-
-def force_fg(h):
-    for _ in range(6):
-        u.SetForegroundWindow(h)
-        time.sleep(0.1)
-        if u.GetForegroundWindow() == h:
-            return True
-    return False
-
-
-def force_fg(hwnd):
-    """强抢前台：跨进程 SetForegroundWindow 常被前台锁静默拒绝。"""
-    if u.GetForegroundWindow() == hwnd:
-        return True
-    fg = u.GetForegroundWindow()
-    t1 = u.GetWindowThreadProcessId(fg, None)
-    t2 = u.GetWindowThreadProcessId(hwnd, None)
-    my = ctypes.windll.kernel32.GetCurrentThreadId()
-    for _ in range(6):
-        u.AttachThreadInput(my, t1, True); u.AttachThreadInput(my, t2, True)
-        u.BringWindowToTop(hwnd); u.SetForegroundWindow(hwnd)
-        u.AttachThreadInput(my, t1, False); u.AttachThreadInput(my, t2, False)
-        time.sleep(0.12)
-        if u.GetForegroundWindow() == hwnd:
-            return True
-    return False
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def main():
     sub = sys.argv[1] if len(sys.argv) > 1 else "记事本"
-    ws = find(sub)
+    ws = find_title_ex(sub)
     if not ws:
         print("FAIL 找不到目标窗口:", sub); return
     hwnd, title = ws[0]
@@ -162,7 +41,7 @@ def main():
     print("输入 ABC 后 caret=%s" % (after_abc,))
     base = after_abc
 
-    win_vi()
+    win_v()
     time.sleep(0.5)
     panel = u.FindWindowW("WinVClipPanelUI", None)
     vis = bool(panel) and bool(u.IsWindowVisible(panel))

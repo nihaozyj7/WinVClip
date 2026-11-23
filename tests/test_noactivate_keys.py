@@ -8,87 +8,9 @@
 
 用法：python test_noactivate_keys.py [目标窗口标题子串]
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-k32 = ctypes.windll.kernel32
-u.SetProcessDPIAware()
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
-                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
-                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
-                ("rcCaret", wintypes.RECT)]
-
-VK = dict(win=0x5B, v=0x56, esc=0x1B, enter=0x0D, down=0x28, up=0x26, ctrl=0x11)
-
-
-def key(vk, up=False):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def tap(vk):
-    key(vk); time.sleep(0.04); key(vk, True); time.sleep(0.04)
-
-
-def win_vi():
-    key(VK["win"]); time.sleep(0.05)
-    key(VK["v"]); time.sleep(0.05)
-    key(VK["v"], True); time.sleep(0.05)
-    key(VK["win"], True); time.sleep(0.1)
-
-
-def set_clip(text):
-    k32.GlobalAlloc.restype = ctypes.c_void_p
-    k32.GlobalLock.restype = ctypes.c_void_p
-    k32.GlobalLock.argtypes = [ctypes.c_void_p]
-    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-    u.SetClipboardData.restype = ctypes.c_void_p
-    u.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
-    u.OpenClipboard(None); u.EmptyClipboard()
-    n = (len(text) + 1) * 2
-    h = k32.GlobalAlloc(0x0042, n)
-    p = k32.GlobalLock(h)
-    ctypes.memmove(p, text.encode("utf-16-le") + b"\x00\x00", n)
-    k32.GlobalUnlock(h)
-    u.SetClipboardData(13, h)   # CF_UNICODETEXT
-    u.CloseClipboard()
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256); u.GetClassNameW(h, b, 256); return b.value
-
-
-def find(title_sub):
-    res = []
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(h, l):
-        if u.IsWindowVisible(h) and u.GetWindowTextLengthW(h):
-            b = ctypes.create_unicode_buffer(512)
-            u.GetWindowTextW(h, b, 512)
-            if title_sub.lower() in b.value.lower():
-                res.append((h, b.value))
-        return True
-    u.EnumWindows(cb, 0)
-    return res
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def caret_x(hwnd):
@@ -99,14 +21,9 @@ def caret_x(hwnd):
     return gi.rcCaret.left
 
 
-def rect(h):
-    r = wintypes.RECT(); u.GetWindowRect(h, ctypes.byref(r))
-    return (r.left, r.top, r.right, r.bottom)
-
-
 def main():
     sub = sys.argv[1] if len(sys.argv) > 1 else "记事本"
-    ws = find(sub)
+    ws = find_title_ex(sub)
     if not ws:
         print("FAIL 找不到", sub); return
     hwnd = ws[0][0]
@@ -118,7 +35,7 @@ def main():
     time.sleep(0.4)
 
     x0 = caret_x(hwnd)
-    win_vi(); time.sleep(0.6)
+    win_v(); time.sleep(0.6)
     print("面板可见=%s 前台是记事本=%s" % (u.IsWindowVisible(panel), u.GetForegroundWindow() == hwnd))
 
     # 非激活态的 Ctrl 组合现在整段放行（Ctrl+S / Ctrl+F 属于前台程序，面板不抢，
@@ -139,7 +56,7 @@ def main():
     # 鼠标点击第一条
     set_clip("PASTED-2")
     time.sleep(0.4)
-    win_vi(); time.sleep(0.6)
+    win_v(); time.sleep(0.6)
     r = rect(panel)
     # 列表首行：body 顶部往下约 改：直接点 body 区域垂直居中偏上
     cx = (r[2] - r[0]) // 2

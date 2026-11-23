@@ -9,44 +9,9 @@
 注意：这里必须用 SendInput 发 VK（而不是 KEYEVENTF_UNICODE），
       只有真实键盘事件才会被输入法拦截成组合串。
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-u.FindWindowW.restype = ctypes.c_void_p
-u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-
-def key(vk, up=False):
-    i = INPUT()
-    i.type = 1
-    i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def tap(vk, hold=0.03):
-    key(vk)
-    time.sleep(hold)
-    key(vk, True)
-    time.sleep(hold)
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 
 
 def main():

@@ -1,22 +1,9 @@
+
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
 # -*- coding: utf-8 -*-
 # 依次往剪贴板塞若干条文本，每条之间留出时间给监听程序捕获
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-k = ctypes.windll.kernel32
-k.GlobalAlloc.restype = ctypes.c_void_p
-k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-k.GlobalLock.restype = ctypes.c_void_p
-k.GlobalLock.argtypes = [ctypes.c_void_p]
-k.GlobalUnlock.argtypes = [ctypes.c_void_p]
-u.OpenClipboard.argtypes = [ctypes.c_void_p]
-u.OpenClipboard.restype = wintypes.BOOL
-u.SetClipboardData.restype = ctypes.c_void_p
-u.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
 
 CF_UNICODETEXT = 13
 

@@ -14,46 +14,16 @@ C 非激活态 Esc → 监听收不到（面板消费），面板收起
 
 用法：python test_hook_passthrough.py
 """
-# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
-import os as _os, sys as _sys
-_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-import ctypes, os, subprocess, sys, time
-from ctypes import wintypes
 
-u = ctypes.windll.user32
-k32 = ctypes.windll.kernel32
-u.FindWindowW.restype = ctypes.c_void_p
-u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+import wvclip as w
+from wvclip import *  # noqa: F401,F403  统一键鼠/窗口/剪贴板/断言样板
+
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根（P0 后脚本位于 tests/）
 EXE = os.path.join(HERE, "build", "winvclip.exe")
 TMP = os.environ.get("TEMP", ".")
 HLOG = os.path.join(TMP, "hooklog.txt")
 TLOG = os.path.join(TMP, "winvclip-trace.txt")
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-
-class _I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("u", _I)]
-
-
-def key(vk, up=False):
-    i = INPUT(); i.type = 1; i.u.ki.wVk = vk
-    i.u.ki.dwFlags = 2 if up else 0
-    u.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
-
-
-def tap(vk):
-    key(vk); time.sleep(0.05); key(vk, True); time.sleep(0.05)
 
 
 def chord(mods, vk):
@@ -64,40 +34,10 @@ def chord(mods, vk):
         key(m, True); time.sleep(0.03)
 
 
-def win_vi():
-    key(0x5B); time.sleep(0.06); key(0x56); time.sleep(0.06)
-    key(0x56, True); time.sleep(0.06); key(0x5B, True); time.sleep(0.5)
-
-
-def cls(h):
-    b = ctypes.create_unicode_buffer(256); u.GetClassNameW(h, b, 256); return b.value
-
-
 def click_panel(panel, x, y):
     lp = (y << 16) | (x & 0xFFFF)
     u.PostMessageW(panel, 0x0201, 1, lp)
     u.PostMessageW(panel, 0x0202, 0, lp)
-
-
-def force_fg(hwnd):
-    """跨进程 SetForegroundWindow 常被前台锁静默拒绝，这里绕过前台锁。"""
-    if u.GetForegroundWindow() == hwnd:
-        return True
-    fg = u.GetForegroundWindow()
-    t1 = u.GetWindowThreadProcessId(fg, None)
-    t2 = u.GetWindowThreadProcessId(hwnd, None)
-    my = k32.GetCurrentThreadId()
-    for _ in range(6):
-        u.AttachThreadInput(my, t1, True)
-        u.AttachThreadInput(my, t2, True)
-        u.BringWindowToTop(hwnd)
-        u.SetForegroundWindow(hwnd)
-        u.AttachThreadInput(my, t1, False)
-        u.AttachThreadInput(my, t2, False)
-        time.sleep(0.12)
-        if u.GetForegroundWindow() == hwnd:
-            return True
-    return False
 
 
 def hlog_downs():
@@ -129,8 +69,8 @@ def main():
         os.remove(HLOG)
     if os.path.exists(TLOG):
         os.remove(TLOG)
-    listen = subprocess.Popen([sys.executable, os.path.join(HERE, "hook_listen.py"), HLOG, "40"],
-                              creationflags=0x08000000)
+    listen = subprocess.Popen([sys.executable, os.path.join(HERE, "tests", "hook_listen.py"),
+                               HLOG, "40"], creationflags=0x08000000)
     time.sleep(1.2)
 
     subprocess.run(["taskkill", "/IM", "winvclip.exe", "/F"], capture_output=True)
@@ -160,7 +100,7 @@ def main():
 
     # ---------- 用例 A：非激活态 ----------
     force_fg(nphwnd)
-    win_vi(); time.sleep(0.5)
+    win_v(); time.sleep(0.5)
     print("A 面板可见=%s 非激活态=%s" % (u.IsWindowVisible(panel),
                                      u.GetForegroundWindow() == nphwnd))
     chord([0x11, 0x10], 0x51)         # Ctrl+Shift+Q
@@ -191,7 +131,7 @@ def main():
     tap(0x1B)                          # 先退出输入态（输入态 Esc 直达面板）
     time.sleep(0.4)
     if not u.IsWindowVisible(panel):
-        win_vi(); time.sleep(0.5)
+        win_v(); time.sleep(0.5)
     force_fg(nphwnd)
     time.sleep(0.3)
     ok &= tally("C0", bool(u.IsWindowVisible(panel)) and u.GetForegroundWindow() == nphwnd,
