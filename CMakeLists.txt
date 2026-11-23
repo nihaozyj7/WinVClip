@@ -33,6 +33,8 @@ set(WINVCLIP_SOURCES
     src/glyph/emoji_atlas.cpp
     src/clipboard/capture.cpp
     src/clipboard/paste.cpp
+    src/model/clip_model.cpp
+    src/ui/layout.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
 )
