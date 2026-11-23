@@ -1,8 +1,11 @@
 // app.rc.in —— CMake configure_file 的模板（@ONLY）。
 //
 // 两个刻意的写法：
-//   1. ico 用绝对路径：windres 解析 ICON 的相对路径是相对构建目录，不是 .rc 所在目录；
+//   1. ico 写裸文件名 "app.ico"：ICON 的相对路径是相对 windres 的工作目录（CMake 里固定
+//      成构建目录），CMakeLists 会先把 resources/app.ico 拷到那里。不能写绝对路径——
+//      windres 按本地代码页（GBK/CP936）解析 .rc 里的文件名，工程路径一旦含中文
+//      （如 Desktop\项目合集\...）就报 "can't open icon file ... Illegal byte sequence"；
 //   2. 图标 ID 写字面量 101 而不是 IDI_APP：.rc 不参与 C++ 头文件搜索，且这一份资源只
 //      在链接后由 tools/attach_icon.py 贴上（原因见该脚本注释：ld 2.47 合并 icon 会失败）。
 //      数字需与 src/app/resource.h 里的 IDI_APP 保持一致。
-101 ICON "@WINVCLIP_RES_ICO@"
+101 ICON "app.ico"

@@ -49,7 +49,7 @@ inline constexpr int ROW_H       = 56;
 inline constexpr int RADIUS      = 12;
 // 面板尺寸可调：最小尺寸由「页签 + 三个按钮排得开」和「至少露出两行」定。
 // 宽度下限压到 360 后页签放不下自然宽度，ComputeLayout 里会按可用宽度均分。
-inline constexpr int MIN_W       = 360;
+inline constexpr int MIN_W       = 330;
 inline constexpr int MIN_H       = 340;
 inline constexpr int RESIZE_EDGE = 5;     // 边缘可抓取的带宽（px）
 

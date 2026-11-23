@@ -59,9 +59,15 @@ configure_file(resources/app.rc.in ${WINVCLIP_RC} @ONLY)
 
 add_executable(winvclip WIN32 ${WINVCLIP_SOURCES})
 
+# 图标和 .rc 都先拷进构建目录，windres 只吃相对文件名：它按本地代码页（GBK）解析 .rc 里的
+# 路径，工程放在含中文的目录（如 Desktop\项目合集\...）时，绝对路径会变成乱码打不开，
+# 报 "can't open icon file ... Illegal byte sequence"。工作目录固定成构建目录，
+# 这样 cmd 的 cwd 是它、windres 看到的参数全是 ASCII。
 add_custom_command(TARGET winvclip POST_BUILD
-    COMMAND windres -O coff -o ${WINVCLIP_RES_OBJ} ${WINVCLIP_RC}
-    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/tools/attach_icon.py $<TARGET_FILE:winvclip> ${WINVCLIP_RES_OBJ}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${WINVCLIP_RES_ICO} ${CMAKE_CURRENT_BINARY_DIR}/app.ico
+    COMMAND windres -O coff -o app_icon.obj app.rc
+    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/tools/attach_icon.py winvclip.exe app_icon.obj
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "贴上程序图标资源")
 
 # 图标是链接后附加的，不是编译单元：不声明这层依赖的话，改 app.ico 后 ninja 认为
