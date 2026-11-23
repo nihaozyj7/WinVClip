@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(WINVCLIP_SOURCES
     src/main.cpp
     src/app_state.cpp
+    src/glyph.cpp
     src/text_util.cpp
     src/diag.cpp
     src/io_png.cpp
