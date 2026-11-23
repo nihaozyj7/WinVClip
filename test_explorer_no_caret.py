@@ -155,7 +155,7 @@ def main():
 
     set_clip("ORIGINAL-ABC")
     time.sleep(0.5)
-    click(panel, 235, 17)          # 表情页签
+    click(panel, 184, 17)          # 表情页签
     time.sleep(0.5)
     click(panel, 40, 175)          # 第一格 emoji
     time.sleep(1.6)

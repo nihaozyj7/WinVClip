@@ -84,19 +84,68 @@ def set_clip(s):
     u.CloseClipboard()
 
 
-def edit_text(np):
-    ed = u.FindWindowExW(np, None, "Edit", None)
-    n = u.SendMessageW(ed, 0x000E, 0, 0) or 0
-    buf = ctypes.create_unicode_buffer(n + 2)
-    u.SendMessageW(ed, 0x000D, n + 1, ctypes.addressof(buf))
-    return buf.value
+def get_clip():
+    u.OpenClipboard(None)
+    h = u.GetClipboardData(13)
+    if not h:
+        u.CloseClipboard()
+        return ""
+    p = k.GlobalLock(h)
+    s = ctypes.wstring_at(p)
+    k.GlobalUnlock(h)
+    u.CloseClipboard()
+    return s
+
+
+def find_notepad():
+    """Win11 记事本标题会带 '*'（有改动），不能按标题精确匹配。"""
+    res = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, ctypes.c_void_p, wintypes.LPARAM)
+    def cb(h, l):
+        b = ctypes.create_unicode_buffer(64)
+        u.GetClassNameW(h, b, 64)
+        if b.value == "Notepad" and u.IsWindowVisible(h):
+            res.append(h)
+        return True
+
+    u.EnumWindows(cb, 0)
+    return res[0] if res else None
+
+
+def force_fg(hwnd):
+    """跨进程 SetForegroundWindow 常被前台锁静默拒绝。"""
+    if u.GetForegroundWindow() == hwnd:
+        return True
+    fg = u.GetForegroundWindow()
+    t1 = u.GetWindowThreadProcessId(fg, None)
+    t2 = u.GetWindowThreadProcessId(hwnd, None)
+    my = k.GetCurrentThreadId()
+    for _ in range(6):
+        u.AttachThreadInput(my, t1, True)
+        u.AttachThreadInput(my, t2, True)
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+        u.AttachThreadInput(my, t1, False)
+        u.AttachThreadInput(my, t2, False)
+        time.sleep(0.12)
+        if u.GetForegroundWindow() == hwnd:
+            return True
+    return False
+
+
+def combo(mod, vk):
+    key(mod); time.sleep(0.04); key(vk); time.sleep(0.04)
+    key(vk, True); time.sleep(0.04); key(mod, True); time.sleep(0.04)
 
 
 def main():
     proc = subprocess.Popen(["notepad.exe"])
     time.sleep(1.6)
-    np = u.FindWindowW(None, "无标题 - 记事本") or u.FindWindowW(None, "Untitled - Notepad")
-    u.SetForegroundWindow(np); time.sleep(0.3)
+    np = find_notepad()
+    if not np:
+        raise SystemExit("notepad not found")
+    force_fg(np); time.sleep(0.3)
 
     set_clip("FEED-TEXT-777")     # 让历史里有一条独特文本
     time.sleep(0.6)
@@ -118,6 +167,11 @@ def main():
 
     click(h, 60, 17)              # 历史页
     time.sleep(0.5)
+    # Ctrl 组合在非激活态整段放行（面板不抢前台程序的 Ctrl+S / Ctrl+F，排在钩子链
+    # 后面的别家全局热键也才收得到），所以收藏快捷键要先进输入态：
+    # 点一下搜索框让面板拿到前台，Ctrl+D 走系统 WM_KEYDOWN 直达面板。
+    click(h, 120, 60)             # 搜索框 → 输入态
+    time.sleep(0.4)
     key(0x11)                     # Ctrl
     key(0x44)                     # D
     key(0x44, True)
@@ -125,13 +179,35 @@ def main():
     time.sleep(0.6)
     print("visible after ctrl+D:", vis(h))
 
+    # 输入态里 Esc 直达面板 → 收起；再唤起，去收藏页取那条
+    key(0x1B); time.sleep(0.4)
+    for _ in range(6):
+        winv()
+        for _ in range(30):
+            if vis(h):
+                break
+            time.sleep(0.05)
+        if vis(h):
+            break
+    if not vis(h):
+        proc.terminate()
+        raise SystemExit("panel did not show (2nd)")
+
     click(h, 175, 17)             # 收藏页
     time.sleep(0.6)
     click(h, 300, 170)            # 第一行
     time.sleep(1.0)
 
     print("visible after row click:", vis(h))
-    print("notepad text:", repr(edit_text(np)))
+    # Win11 记事本是 WinUI3，没有 Edit 子窗口，读回文本只能走剪贴板
+    if force_fg(np):
+        time.sleep(0.3)
+        combo(0x11, 0x41)             # Ctrl+A
+        combo(0x11, 0x43)             # Ctrl+C
+        time.sleep(0.5)
+        print("notepad content:", repr(get_clip()))
+    else:
+        print("FAIL 记事本拿不到前台")
     proc.terminate()
 
 

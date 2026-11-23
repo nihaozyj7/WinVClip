@@ -198,7 +198,7 @@ def main():
 
     set_clip("ORIGINAL-ABC")
     time.sleep(0.5)
-    click(h, 235, 17)          # 表情页签
+    click(h, 184, 17)          # 表情页签
     time.sleep(0.4)
     shift = len(sys.argv) > 2 and sys.argv[2] == "shift"
     if shift:

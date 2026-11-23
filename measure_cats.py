@@ -29,7 +29,7 @@ def wait_panel(timeout=5.0):
 h = wait_panel()
 if not h:
     raise SystemExit("panel not visible")
-click(h, 235, 20)          # 表情页签
+click(h, 184, 20)          # 表情页签
 time.sleep(0.4)
 pts = [(300, 120), (350, 120), (400, 120), (330, 120)]
 for k in range(8):

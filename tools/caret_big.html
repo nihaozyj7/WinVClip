@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>caret big</title>
+<style>
+body{font:16px sans-serif;margin:24px}
+input,textarea,div[contenteditable]{font:16px sans-serif;padding:8px;display:block;margin:14px 0;border:2px solid #888}
+#big{width:640px;height:280px}
+#small{width:640px}
+#ed{width:640px;height:120px;overflow:auto}
+</style>
+</head><body>
+<p>大输入框插入符探针（第 1 行 / 第 3 行 / 多行 textarea / 大字 contenteditable）</p>
+<textarea id="big">line one alpha beta gamma delta
+line two alpha beta gamma delta
+line three alpha beta gamma delta
+line four alpha beta gamma delta
+line five alpha beta gamma delta
+line six alpha beta gamma delta
+line seven alpha beta gamma delta
+line eight alpha beta gamma delta</textarea>
+<input id="small" value="small plain input value">
+<div id="ed" contenteditable="true">editable one alpha beta gamma
+editable two alpha beta gamma
+editable three alpha beta gamma</div>
+<script>
+  const t = document.getElementById('big');
+  t.focus();
+  // 光标放到第 3 行中段（无选中）
+  const lines = t.value.split('\n');
+  let off = lines[0].length + 1 + lines[1].length + 1 + 8;
+  t.setSelectionRange(off, off);
+</script>
+</body></html>

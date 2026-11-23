@@ -118,10 +118,14 @@ def main():
     win_vi(); time.sleep(0.6)
     print("面板可见=%s 前台是记事本=%s" % (u.IsWindowVisible(panel), u.GetForegroundWindow() == hwnd))
 
-    # Ctrl+2 切到「收藏」页再切回来，验证 ctrl 组合被转发且面板不崩
-    key(VK["ctrl"]); tap(0x32); key(VK["ctrl"], True); time.sleep(0.3)
-    key(VK["ctrl"]); tap(0x31); key(VK["ctrl"], True); time.sleep(0.3)
-    print("切页后面板仍可见=%s" % u.IsWindowVisible(panel))
+    # 非激活态的 Ctrl 组合现在整段放行（Ctrl+S / Ctrl+F 属于前台程序，面板不抢，
+    # 排在钩子链后面的别家全局热键也才收得到），切页改用 Tab：
+    # 输入态（点搜索框）里 Ctrl+数字 依然有效，走的是系统 WM_KEYDOWN。
+    tap(0x09); time.sleep(0.3)        # Tab -> 收藏页
+    tap(0x09); time.sleep(0.3)        # Tab -> 表情页
+    tap(0x09); time.sleep(0.3)        # Tab -> 符号页
+    tap(0x09); time.sleep(0.3)        # Tab -> 历史页
+    print("Tab 切页后面板仍可见=%s" % u.IsWindowVisible(panel))
 
     tap(VK["enter"])
     time.sleep(0.9)

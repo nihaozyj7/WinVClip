@@ -169,7 +169,7 @@ def main():
     time.sleep(0.4)
     print("pinned, visible:", vis(h))
 
-    click(h, 235, 17)                 # 表情页
+    click(h, 184, 17)                 # 表情页
     time.sleep(0.4)
     for ch in b"cat":
         u.PostMessageW(h, 0x0102, ch, 0)

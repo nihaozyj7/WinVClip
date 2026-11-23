@@ -416,9 +416,9 @@ input{font-family:inherit;color:inherit}
     EMO_CAT[c.k] = c;
     c.items.forEach(function(it){ EMO_ALL.push([it[0], it[1], it[2]||'', c.k]); EMO_NAME[it[0]] = it[1]; });
   });
-  /* 表情数据里补一个动态的「最近使用」分类，与符号页保持一致 */
+  /* 表情数据里补一个动态的「最近」分类，与符号页保持一致 */
   if(!EMO_CAT.recent){
-    const _rc = { k:'recent', n:'最近使用', items:[] };
+    const _rc = { k:'recent', n:'最近', items:[] };
     EMO_DATA.cats.unshift(_rc);
     EMO_CAT.recent = _rc;
   }
@@ -426,7 +426,7 @@ input{font-family:inherit;color:inherit}
   /* 表情首字形速查，供「更多」抽屉入口显示 */
   function firstGlyph(cat){ return (cat && cat.items.length) ? cat.items[0][0] : '·'; }
 
-  /* ---------------- 最近使用（localStorage 持久化） ---------------- */
+  /* ---------------- 最近（localStorage 持久化） ---------------- */
   const LS = {
     get:function(k, d){ try{ const v = localStorage.getItem('cr.'+k); return v ? JSON.parse(v) : d; }catch(e){ return d; } },
     set:function(k, v){ try{ localStorage.setItem('cr.'+k, JSON.stringify(v)); }catch(e){} }
@@ -570,7 +570,7 @@ input{font-family:inherit;color:inherit}
     return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  /* 某分类应当显示的条目：最近使用是动态的，其余取静态数据 */
+  /* 某分类应当显示的条目：最近是动态的，其余取静态数据 */
   function itemsOf(page, key){
     if(page==='symbol'){
       if(key==='recent') return state.recentSym.map(function(g){ return [g, SYM_NAME[g]||g]; });
@@ -609,7 +609,7 @@ input{font-family:inherit;color:inherit}
       const isRecent = !q && curKey==='recent';
       body.innerHTML = '<div class="empty">'
         + '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#747A7D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'+P.star+'</svg>'
-        + '<h3>'+(isRecent ? '还没有最近使用' : '没有匹配的结果')+'</h3>'
+        + '<h3>'+(isRecent ? '还没有最近' : '没有匹配的结果')+'</h3>'
         + '<p>'+(isRecent
             ? '复制任意'+(isSym?'符号':'表情')+'后，它就会出现在这里。'
             : '换个关键词试试，或点右上角「⋯」换个分类。')+'</p></div>';

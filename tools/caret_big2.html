@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>caret big2</title>
+<style>
+body{font:16px sans-serif;margin:20px}
+.box{border:2px solid #888;padding:8px;margin:12px 0;width:660px}
+#empty{height:120px}
+#empty:empty:before{content:"Ask anything…";color:#999}
+#rich{height:220px;overflow:auto}
+#rich p{margin:0 0 10px 0}
+.lbl{color:#666;font-size:12px}
+iframe{width:680px;height:90px;border:2px solid #c00}
+</style>
+</head><body>
+<div class="lbl">empty contenteditable (placeholder)</div>
+<div id="empty" class="box" contenteditable="true"></div>
+<div class="lbl">scrolling rich contenteditable</div>
+<div id="rich" class="box" contenteditable="true"><p>paragraph one alpha beta gamma</p><p>paragraph two alpha beta gamma</p><p>paragraph three alpha beta gamma</p><p>paragraph four alpha beta gamma</p><p>paragraph five alpha beta gamma</p><p>paragraph six alpha beta gamma</p><p>paragraph seven alpha beta gamma</p><p>paragraph eight alpha beta gamma</p></div>
+<div class="lbl">iframe input</div>
+<iframe srcdoc='&lt;body style="margin:8px"&gt;&lt;textarea id="t" style="font:16px sans-serif;width:600px;height:44px;border:2px solid #888;padding:6px"&gt;iframe textarea text&lt;/textarea&gt;&lt;/body&gt;'></iframe>
+</body></html>

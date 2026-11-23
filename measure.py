@@ -81,7 +81,7 @@ def main():
     if not h:
         raise SystemExit("panel not visible")
     if what == "emo":
-        click(h, 235, 20)
+        click(h, 184, 20)
     elif what == "sym":
         click(h, 313, 20)
     elif what == "hist":

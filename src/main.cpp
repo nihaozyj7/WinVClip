@@ -1,4 +1,4 @@
-// WinVClip —— 接管 Win+V，弹出自定义剪贴板面板
+﻿// WinVClip —— 接管 Win+V，弹出自定义剪贴板面板
 // 视觉稿：Clipboard Reliquary · PC Panel · 560 × 620（1:1 还原 index.html）
 // 构建：cmake -G Ninja -B build && cmake --build build
 // 用法：winvclip.exe            常驻托盘，Win+V 弹面板
@@ -6,6 +6,8 @@
 //
 // 原理：
 //   1) WH_KEYBOARD_LL 全局钩子：Win 按下 + V 按下 -> 吞掉该键，同步弹面板
+//      面板非激活态要用的按键也由它旁路转发，但只接面板会消费的键
+//      （见 PanelConsumesBareKey：钩子是串行链，吞得越宽，别家的全局热键越哑）
 //   2) AddClipboardFormatListener 监听 WM_CLIPBOARDUPDATE，延迟读取剪贴板存历史
 //   3) 自绘 popup 面板；回车单击 = 写回剪贴板 + 向原窗口发 Ctrl+V
 
@@ -27,6 +29,8 @@
 #include <dwrite.h>
 #include <initguid.h>   // 让 wincodec.h 把 PNG 编码器/像素格式的 GUID 定义成实体
 #include <wincodec.h>
+#include <uiautomation.h>   // 浏览器/Electron 的插入符只能从 UIA 文本模式读到（见 UiaCaretRect）
+#include <tlhelp32.h>       // 焦点元素可能是浏览器的渲染子进程，判归属要查进程树
 #include <commdlg.h>
 #include <imm.h>       // 搜索框要能吃中文：IME 组合串自己收、自己画
 #include <utility>
@@ -82,9 +86,11 @@ enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };
 // 筛选
 enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
 
-enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10 };
+enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10,
+       WM_APP_HIDE_OUTSIDE = WM_APP + 11 };
 enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
-       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108, TIMER_CLIPRESTORE = 0x109 };
+       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108, TIMER_CLIPRESTORE = 0x109,
+       TIMER_REPROBE = 0x10A, TIMER_DEFERHIDE = 0x10B };
 
 // ================================================================== 数据
 
@@ -138,7 +144,8 @@ struct GCat {
 
 struct RecentGlyph { std::string g, n; };  // 最近使用：字形 + 名称（UTF-8）
 
-static HHOOK  g_hook  = nullptr;
+static HHOOK  g_hook  = nullptr;      // 低级键盘：Win+V 热键 + 面板按键转发
+static HHOOK  g_mouseHook = nullptr;  // 低级鼠标：点面板外部即收起
 static HWND   g_main  = nullptr;
 static HWND   g_panel = nullptr;
 static HWND   g_target = nullptr;
@@ -157,6 +164,9 @@ static bool   g_ctrlDown = false, g_shiftDown = false;
 static bool   g_swallowVUp = false;
 static bool   g_vDown = false;       // V 当前是否处于按下（用来识别长按产生的自动重复键）
 static DWORD  g_vDownAt = 0;
+// 已经吞下 keydown 的键，等它的 keyup 一起吞。不配对的话目标窗口会收到一个
+// 没有 down 的 up，个别程序会把它当成一次组合键的结束。面板收起时清空。
+static bool   g_swallowed[256] = {};
 
 // 自己注入的按键统一打上这个标记。钩子靠它区分「本程序注入」和「其他来源的注入」：
 // 前者必须放行（否则固定态连着插表情时，自己注入的字符会被自己的钩子吞掉），
@@ -201,6 +211,9 @@ static POINT g_dragFrom{0, 0};     // 按下时的屏幕坐标
 static RECT  g_dragRect{0, 0, 0, 0}; // 按下时的窗口位置
 static bool g_modalOpen = false;
 static int  g_modalRow = -1;
+// 「点外面收起」这条路上不许抢前台：用户点的窗口正等着激活，HidePanel 若趁机
+// SetForegroundWindow(g_target) 就会把前台拽回去（前台锁会让用户那次点击落空）。
+static bool g_hideNoRestore = false;
 
 static bool g_pinned = false;        // 临时固定：本次显示期间不失焦隐藏 + 置顶，关闭后自动取消
 static std::wstring g_typePending;   // 待注入的文本（表情/符号直插，不经剪贴板）
@@ -230,6 +243,10 @@ enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
 
 static bool g_caretOn = true;
 static int  g_gridScroll = 0;      // 表情/符号页的纵向滚动（像素）
+// 用户自己拖过面板 / 改过尺寸：这次的自动定位就作废，别再把他摆好的面板挪走
+static bool g_posUserSet = false;
+// 首次探测不到插入符时的补探测次数（Chromium 的可访问性树是懒建的，第一次问常常还没建好）
+static int  g_reprobeLeft = 0;
 
 // 面板是否处于「输入态」：见文件开头焦点模型的说明
 static bool     g_inputMode = false;
@@ -269,6 +286,7 @@ static PerfAcc       g_perfAcc;
 static LARGE_INTEGER g_perfFreq{};
 
 static LONGLONG PerfNow() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }
+static void Trace(const char* fmt, ...);   // 诊断日志（WV_TRACE=1 时写 %TEMP%\winvclip-trace.txt）
 static double PerfMs(LONGLONG t) {
     return g_perfFreq.QuadPart ? (double)t * 1000.0 / (double)g_perfFreq.QuadPart : 0.0;
 }
@@ -283,6 +301,7 @@ static void WarmLog(const char* fmt, int a, int b) {
 static std::vector<GCat>    g_symCats, g_emoCats;
 static std::vector<RecentGlyph> g_recentSym, g_recentEmo;
 static std::vector<GItem>   g_recentSymItems, g_recentEmoItems;
+static int g_recentCount[2] = {0, 0};      // [0]=表情 [1]=符号：过滤后还剩几条「最近」
 static std::vector<GItem>   g_glyphHits;      // 跨分类搜索结果（搜索时替代分类条目）
 static std::wstring         g_hitsQuery;      // 命中所对应的查询串
 static int                  g_hitsPage = -1;
@@ -452,6 +471,7 @@ static void RebuildRecentItems(bool sym) {
         it.n = r.n.data(); it.nl = (int)r.n.size();
         dst.push_back(it);
     }
+    g_recentCount[sym ? 1 : 0] = (int)dst.size();
 }
 
 static int GlyphCatTotal(int page) {
@@ -474,7 +494,7 @@ static int GlyphCatIndexByKey(int page, const char* key) {
 }
 
 static std::wstring GlyphCatName(int page, int idx) {
-    if (idx <= 0) return L"最近使用";
+    if (idx <= 0) return L"最近";
     return U8N(GlyphCat(page, idx).name.data(), (int)GlyphCat(page, idx).name.size());
 }
 
@@ -484,6 +504,17 @@ static int GlyphCatCount(int page, int idx) {
         return (int)(page == PG_EMOJI ? g_recentEmoItems.size() : g_recentSymItems.size());
     }
     return GlyphCat(page, idx).count;
+}
+
+// 「最近」是动态分类：一条都还没用过时它是空的。这种时候它整条都不该出现
+// （分类条 chip / 抽屉 / 角标 / 抽屉标题的计数一起隐藏），否则面板一打开就是
+// 一个空的「还没有最近」页面。
+static bool RecentEmpty(int page) {
+    bool sym = (page == PG_SYMBOL);
+    const std::vector<RecentGlyph>& src = sym ? g_recentSym : g_recentEmo;
+    if (!src.empty() && (sym ? g_recentSymItems : g_recentEmoItems).empty())
+        RebuildRecentItems(sym);          // 有原始记录但索引还没建
+    return g_recentCount[sym ? 1 : 0] == 0;
 }
 
 static int CurGlyphCat(int page) { return page == PG_EMOJI ? g_emojiCat : g_symCat; }
@@ -2354,6 +2385,12 @@ static const wchar_t* FILTER_NAME[4] = {L"全部", L"文本", L"图片", L"其�
 
 static void ComputeLayout() {
     RebuildGlyphHits();       // 关键词/页面一变就重新做一次跨分类搜索（未变时是字符串比较）
+    // 「最近」为空时它不可见，当前分类就不能停在它上面：否则整页空白、分类条也没有高亮项。
+    if ((g_page == PG_EMOJI || g_page == PG_SYMBOL) && CurGlyphCat(g_page) <= 0 && RecentEmpty(g_page)) {
+        if (g_page == PG_EMOJI) g_emojiCat = GlyphCatTotal(g_page) > 0 ? 1 : 0;
+        else                    g_symCat   = GlyphCatTotal(g_page) > 0 ? 1 : 0;
+        g_gridScroll = 0;
+    }
     int W = g_panelW ? g_panelW : S(P_W);
     int H = g_panelH ? g_panelH : S(P_H);
     L.W = W; L.H = H;
@@ -2376,7 +2413,7 @@ static void ComputeLayout() {
     int avail = L.pinB.left - S(6) - x0;
     int nat[4], total = tabGap * 3;
     for (int i = 0; i < 4; ++i) {
-        nat[i] = TextW(g_fTab, TAB_NAME[i]) + S(30);
+        nat[i] = TextW(g_fTab, TAB_NAME[i]) + S(20);
         total += nat[i];
     }
     int x = x0;
@@ -2418,7 +2455,7 @@ static void ComputeLayout() {
     if (g_page == PG_EMOJI || g_page == PG_SYMBOL) {
         int page = g_page;
         int show[5], n = 0;
-        show[n++] = 0;                          // 最近使用永远第一
+        if (!RecentEmpty(page)) show[n++] = 0;   // 「最近」为空时整条分类隐藏
         static const char* PINS_SYM[] = {"quick", "punct", "math"};
         static const char* PINS_EMO[] = {"smileys", "people", "nature"};
         const char* const* pins = (page == PG_SYMBOL) ? PINS_SYM : PINS_EMO;
@@ -2534,7 +2571,8 @@ static void ComputeDrawer() {
     // 两页同构：只有一层分类（符号的大类＝数据里的「域」，已在生成期合并），
     // 因此不再有域分组标题，抽屉就是一片按钮。
     const std::vector<GCat>& cats = (page == PG_SYMBOL) ? g_symCats : g_emoCats;
-    Sec s; s.cats.push_back(0);
+    Sec s; 
+    if (!RecentEmpty(page)) s.cats.push_back(0);   // 「最近」为空时抽屉里也没有它
     for (size_t i = 0; i < cats.size(); ++i) s.cats.push_back((int)i + 1);
     secs.push_back(std::move(s));
 
@@ -2832,7 +2870,7 @@ static void PaintFilters(HDC dc) {
         FillRound(dc, mb, S(13), on ? C_VOLTSOFT : (g_hoverChip == 903 ? C_SUBTLE : C_SURFACE),
                   on ? C_VOLT : C_LINE);
         TextOutF(dc, g_fChip, C_INK, L"⋯", mb, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-        int badge = GlyphCatTotal(g_page) + 1;      // +1 = 「最近使用」
+        int badge = GlyphCatTotal(g_page) + (RecentEmpty(g_page) ? 0 : 1);   // +1 = 「最近」
         std::wstring bs = std::to_wstring(badge);
         int bw = (std::max)(S(15), TextW(g_fToast, bs) + S(5));
         // 角标压在按钮右上角外侧：不遮住「⋯」本身，也不越过窗口边（右缘还有 16px 余量）
@@ -2987,7 +3025,7 @@ static void PaintEmoji(HDC dc) {
     const std::vector<GItem>& list = GlyphItems(PG_EMOJI);
     if (list.empty()) {
         bool recent = g_query.empty() && CurGlyphCat(PG_EMOJI) <= 0;
-        PaintGlyphEmpty(dc, recent ? L"还没有最近使用" : L"没有匹配的结果",
+        PaintGlyphEmpty(dc, recent ? L"还没有最近" : L"没有匹配的结果",
                         recent ? L"点任意表情后，它会出现在这里" : L"换个关键词试试");
         return;
     }
@@ -3031,7 +3069,7 @@ static void PaintSymbols(HDC dc) {
     const std::vector<GItem>& list = GlyphItems(PG_SYMBOL);
     if (list.empty()) {
         bool recent = g_query.empty() && CurGlyphCat(PG_SYMBOL) <= 0;
-        PaintGlyphEmpty(dc, recent ? L"还没有最近使用" : L"没有匹配的结果",
+        PaintGlyphEmpty(dc, recent ? L"还没有最近" : L"没有匹配的结果",
                         recent ? L"点任意符号后，它会出现在这里" : L"换个关键词或分类试试");
         return;
     }
@@ -3087,7 +3125,7 @@ static void PaintDrawer(HDC dc) {
     FillBox(dc, L.drawerHead, C_CANVAS);
     HLine(dc, 0, L.W, L.drawerHead.bottom - 1, C_LINE);
 
-    int total = GlyphCatTotal(g_page) + 1;         // +1 = 「最近使用」
+    int total = GlyphCatTotal(g_page) + (RecentEmpty(g_page) ? 0 : 1);   // +1 = 「最近」
     std::wstring title = L"全部分类 · " + std::to_wstring(total) + L" 类";
     RECT tr{S(16), L.drawerHead.top, L.W - S(70), L.drawerHead.bottom};
     TextOutF(dc, g_fChip, C_MUTED, title, tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
@@ -3465,6 +3503,18 @@ static void ShowPanel();
 static void PasteItem(int vi);
 static void ForceForeground(HWND hwnd);
 static bool CaretRectOf(HWND wnd, RECT* out);
+// 插入符探测结果：caret 是插入符本身，box（可选）是它所在的输入控件矩形。
+// box 只用来「别挡住输入框」，因此宁可缺也不能错——整窗/整页的矩形会在 ShowPanel 里被否掉。
+struct CaretInfo {
+    RECT caret{};
+    RECT box{};
+    bool hasBox = false;
+    // 插入符位置是「框内近似」而非真读到的：Chromium 对空文本框只回整框，
+    // 这时用框内首行位置顶上，仍值得补探一次更准的（见 UiaCaretRect / TIMER_REPROBE）。
+    bool approx = false;
+};
+static bool ProbeCaret(HWND target, CaretInfo* ci);
+static void MovePanelToCaret(const CaretInfo& ci);
 
 static void Toast(const std::wstring& msg, bool info = false) {
     g_toast = msg;
@@ -4010,6 +4060,7 @@ static void PanelKeyDown(int vk, bool ctrl) {
 // 字符输入：同样两个入口（WM_CHAR / 钩子转发的字符）
 static void PanelChar(wchar_t c) {
     if (c >= 32 && c != 127) {
+        Trace("panel char '%c' query=%ls", (char)c, g_query.c_str());
         g_query.push_back(c);
         g_sel = 0; g_top = 0;
         BuildView(); ComputeLayout();
@@ -4046,6 +4097,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool more = PumpEmojiUploads();
             if (g_page == PG_EMOJI) Redraw(&L.body);
             if (more) SetTimer(hwnd, TIMER_EMOJI, 8, nullptr);
+        } else if (wp == TIMER_REPROBE) {
+            // 补探测：首轮没拿到插入符时的第二次机会。用户动过面板就不再挪。
+            KillTimer(hwnd, TIMER_REPROBE);
+            if (g_posUserSet || g_pinned || g_dragging || !g_target || !IsWindow(g_target)) return 0;
+            if (GetForegroundWindow() != g_target) return 0;
+            CaretInfo ci;
+            if (ProbeCaret(g_target, &ci) && !ci.approx) {
+                MovePanelToCaret(ci);
+                g_reprobeLeft = 0;
+            } else if (--g_reprobeLeft > 0) {
+                SetTimer(hwnd, TIMER_REPROBE, 160, nullptr);
+            }
         } else if (wp == TIMER_FOCUS) {
             // 轮询前台窗口。非激活态下面板收不到 WA_INACTIVE（它本来就没被激活过），
             // 所以「用户有没有切走」只能靠轮询看前台是谁，见 PanelShouldStay。
@@ -4059,6 +4122,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_inputMode = false;
                 }
             }
+        } else if (wp == TIMER_DEFERHIDE) {
+            // WA_INACTIVE 那一瞬间前台还没落定，见 WM_ACTIVATE 里的说明：
+            // 等它落定再判，否则收起时的「还前台」会和用户那次点击抢。
+            KillTimer(hwnd, TIMER_DEFERHIDE);
+            PostMessageW(hwnd, WM_APP_DEFER_HIDE, 0, 0);
         }
         return 0;
 
@@ -4068,6 +4136,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     // 非激活态下按键由钩子转发到这里（面板没有键盘焦点，见 LLKeyboard）
     case WM_APP_PANELKEY:
+        Trace("panelkey vk=0x%02X ch=%04X", (unsigned)wp, (unsigned)HIWORD(lp));
         PanelKeyDown((int)wp, LOWORD(lp) != 0);
         if (HIWORD(lp)) PanelChar((wchar_t)HIWORD(lp));
         return 0;
@@ -4321,6 +4390,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetWindowRect(hwnd, &g_rsRect);
             g_rsFrom = sc;
             g_resizing = rs;
+            g_posUserSet = true;      // 用户自己摆过位置，补探测不许再挪
             SetCapture(hwnd);
             return 0;
         }
@@ -4336,6 +4406,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 GetWindowRect(hwnd, &g_dragRect);
                 g_dragFrom = sc;
                 g_dragging = true;
+                g_posUserSet = true;   // 同上：用户已经把面板摆到想要的地方了
                 SetCapture(hwnd);
                 return 0;
             }
@@ -4451,7 +4522,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             // 输入态下失去前台：可能是用户点回了目标窗口（正常，继续留着），
             // 也可能是点去了别的窗口。统一交给 PanelShouldStay 判断，别在这里下结论。
-            PostMessageW(hwnd, WM_APP_DEFER_HIDE, 0, 0);
+            // 但前台切换此刻常常还没落定（GetForegroundWindow() 仍返回面板自己），
+            // 这时收起会走「还前台」分支，把用户正要点的那次激活挤掉——实测点了
+            // 另一个应用，前台却被拽回上一个窗口。所以先等落定再判。
+            if (GetForegroundWindow() == hwnd) SetTimer(hwnd, TIMER_DEFERHIDE, 120, nullptr);
+            else PostMessageW(hwnd, WM_APP_DEFER_HIDE, 0, 0);
             return 0;
         }
         return 0;
@@ -4465,6 +4540,22 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HidePanel();
         }
         return 0;
+
+    // 低级鼠标钩子看到「按下的点落在面板矩形之外」时投递过来（见 LLMouse）。
+    // 光靠前台变化判不出来这种情况：非激活态下面板从不改变前台，用户在同一个
+    // 窗口里点掉面板旁边的正文/地址栏时，GetForegroundWindow() 纹丝不动。
+    case WM_APP_HIDE_OUTSIDE:
+        Trace("WM_APP_HIDE_OUTSIDE fg=%p root=%p", (void*)GetForegroundWindow(), (void*)wp);
+        if (g_pinned || g_dialogOpen || g_dragging || g_resizing) return 0;
+        // 用户点的若不是唤起时的目标窗口（点了别的应用、桌面…），那个窗口马上会
+        // 激活，收起时别去抢前台，否则它抢不过前台锁，用户会觉得「点了没反应」。
+        g_hideNoRestore = ((HWND)wp != g_target);
+        g_menuOpen = false;
+        g_modalOpen = false;
+        g_drawerOpen = false;
+        g_drawerHover = -1;
+        HidePanel();
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -4476,13 +4567,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 //   2. 表情/符号直插之前判断目标窗口到底有没有文本输入区。资源管理器的文件列表、
 //      桌面这类地方没有插入符，把字符注入进去什么也插不进，还会触发系统提示音。
 static bool CaretRectOf(HWND wnd, RECT* out) {
-    if (!wnd || !IsWindow(wnd)) return false;
+    if (!wnd || !IsWindow(wnd)) { Trace("  caret: no target wnd (%p)", (void*)wnd); return false; }
     if (wnd == g_panel || wnd == g_main) return false;
     DWORD tid = GetWindowThreadProcessId(wnd, nullptr);
     if (!tid) return false;
     GUITHREADINFO gi{}; gi.cbSize = sizeof(gi);
-    if (!GetGUIThreadInfo(tid, &gi)) return false;
-    if (!gi.hwndCaret || !IsWindow(gi.hwndCaret)) return false;
+    if (!GetGUIThreadInfo(tid, &gi)) { Trace("  caret: GetGUIThreadInfo fail tid=%lu", (unsigned long)tid); return false; }
+    if (!gi.hwndCaret || !IsWindow(gi.hwndCaret)) {
+        Trace("  caret: hwndCaret=%p focus=%p wnd=%p tid=%lu", (void*)gi.hwndCaret, (void*)gi.hwndFocus,
+              (void*)wnd, (unsigned long)tid);
+        return false;
+    }
 
     RECT rc = gi.rcCaret;
     // rcCaret 的坐标基准在文档与实测之间不一致（一部分窗口给的是客户区坐标），
@@ -4496,14 +4591,373 @@ static bool CaretRectOf(HWND wnd, RECT* out) {
     };
     if (inside(conv, wr)) *out = conv;
     else if (inside(rc, wr)) *out = rc;
-    else return false;
+    else { Trace("  caret: rect outside wnd rc=%ld,%ld,%ld,%ld conv=%ld,%ld wr=%ld,%ld,%ld,%ld",
+                 rc.left, rc.top, rc.right, rc.bottom, conv.left, conv.top,
+                 wr.left, wr.top, wr.right, wr.bottom); return false; }
 
     if (out->right - out->left < 1) out->right = out->left + 1;
     if (out->bottom - out->top < 1) out->bottom = out->top + S(16);   // 折叠成一点的 caret
     return true;
 }
 
+// 原生通道的「输入框矩形」：焦点控件（Edit / RichEdit / 记事本的编辑区…）的窗口矩形。
+// 只当它是控件、而不是整窗时才认（见 ShowPanel 里的合理性判断）。
+static bool FocusBoxOf(HWND wnd, RECT* out) {
+    DWORD tid = GetWindowThreadProcessId(wnd, nullptr);
+    if (!tid) return false;
+    GUITHREADINFO gi{}; gi.cbSize = sizeof(gi);
+    if (!GetGUIThreadInfo(tid, &gi)) return false;
+    if (!gi.hwndFocus || !IsWindow(gi.hwndFocus)) return false;
+    return GetWindowRect(gi.hwndFocus, out) != 0;
+}
+
+// ---------------------------------------------------------------- UIA 兜底：浏览器 / Electron
+// Chromium / Electron（Edge、Chrome、VS Code、各种内嵌浏览器、Slack…）把文本插入符放在
+// 渲染进程里，GetGUIThreadInfo 的 hwndCaret 恒为 0 ——「光标明明在闪，却读不到」。
+// 它们的可访问性（UIA）文本模式能给出插入符 / 选区的屏幕矩形，是这类窗口唯一能让面板
+// 贴着光标弹出的通道（早期版本只走 GetGUIThreadInfo，于是这些窗口一律退回屏幕居中）。
+// 代价：第一次访问 Chromium 会唤醒它的可访问性树（几十~几百 ms），所以只在
+// GetGUIThreadInfo 失败时才走这里，并且把 UIA 的连接超时压到 500ms（默认 2s）。
+static IUIAutomation* g_uia = nullptr;
+static bool           g_uiaTried = false;
+
+static IUIAutomation* UiaClient() {
+    if (g_uiaTried) return g_uia;
+    g_uiaTried = true;
+    IUIAutomation* uia = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IUIAutomation, (void**)&uia);
+    if (FAILED(hr) || !uia) { Trace("  uia: create fail hr=%08lx", (unsigned long)hr); return nullptr; }
+    IUIAutomation2* uia2 = nullptr;
+    if (SUCCEEDED(uia->QueryInterface(IID_IUIAutomation2, (void**)&uia2)) && uia2) {
+        uia2->put_ConnectionTimeout(500);
+        uia2->Release();
+    }
+    g_uia = uia;
+    return g_uia;
+}
+
+// 取文本范围的包围矩形：SAFEARRAY 里每 4 个 double 是 (left, top, width, height)，
+// 屏幕物理像素。多组时插入符一般只有一组，选区则按 last 取末尾那组（光标在选区末端）。
+static bool UiaRangeRect(IUIAutomationTextRange* range, bool last, RECT* out) {
+    SAFEARRAY* sa = nullptr;
+    if (FAILED(range->GetBoundingRectangles(&sa)) || !sa) return false;
+    bool ok = false;
+    double* d = nullptr;
+    if (SUCCEEDED(SafeArrayAccessData(sa, (void**)&d)) && d) {
+        long lo = 0, hi = -1;
+        SafeArrayGetLBound(sa, 1, &lo);
+        SafeArrayGetUBound(sa, 1, &hi);
+        long n = (hi >= lo) ? (hi - lo + 1) / 4 : 0;
+        if (n > 0) {
+            long i = last ? n - 1 : 0;
+            double x = d[i * 4], y = d[i * 4 + 1], w = d[i * 4 + 2], h = d[i * 4 + 3];
+            if (h > 0.5) {
+                if (w < 1.0) w = 1.0;
+                out->left = (LONG)lround(x);
+                out->top = (LONG)lround(y);
+                out->right = (LONG)lround(x + w);
+                out->bottom = (LONG)lround(y + h);
+                ok = (out->right > out->left) && (out->bottom > out->top);
+            }
+        }
+        SafeArrayUnaccessData(sa);
+    }
+    SafeArrayDestroy(sa);
+    return ok;
+}
+
+// 焦点元素是不是「目标窗口自己的东西」。
+// Chromium / Electron 把页面内容放在渲染子进程里：网页输入框的焦点元素 pid 是那个子进程，
+// 和顶层窗口的 pid 不同。早期这里按 pid 严格判等，结果网页里的输入框一律被当成
+// 「别人的窗口」静默拒掉（地址栏属于浏览器进程，反而能过）——这就是「浏览器输入框读不到」。
+// 现在认「同进程 或 目标进程的子孙进程」；面板自己、输入法候选窗这类旁支仍然被挡在外面。
+static bool ProcessIsSelfOrDescendant(DWORD pid, DWORD ancestor) {
+    if (!pid || !ancestor) return false;
+    if (pid == ancestor) return true;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    DWORD cur = pid;
+    for (int depth = 0; depth < 6 && cur; depth++) {
+        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+        DWORD parent = 0;
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ProcessID == cur) { parent = pe.th32ParentProcessID; break; }
+            } while (Process32NextW(snap, &pe));
+        }
+        if (!parent) break;
+        if (parent == ancestor) { found = true; break; }
+        cur = parent;
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// 插入符矩形是不是「控件整体矩形」。
+// Chromium 系（Edge / WebView2 / Electron）在文本框内容为空、或同一文本视图里拿不到
+// 字符布局时，会把整个控件框当成范围的包围盒返回：实测 WebView2 的聊天输入框
+// （931x46）、Chromium 的空 textarea（660x300）都直接回整框，和真实插入符（1x17）
+// 差着整块控件。采信它，落点算法就会把「整框」当成要避让的光标行，
+// 面板被甩到框外远处——这就是「读到的明显是整个大输入框」。
+static bool CaretRectIsBox(const RECT& c, const RECT& b) {
+    int cw = c.right - c.left, ch = c.bottom - c.top;
+    int bw = b.right - b.left, bh = b.bottom - b.top;
+    if (cw <= 0 || ch <= 0 || bw <= 0 || bh <= 0) return false;
+    long long ca = (long long)cw * ch, ba = (long long)bw * bh;
+    if (ca * 10 >= ba * 8) return true;                         // 面积占了框的 8 成
+    if (bw >= 40 && cw * 10 >= bw * 8 && ch >= bh - 2) return true;  // 和框一样宽一样高
+    return false;
+}
+
+// 框内近似的插入符：内容为空 / 布局不可得时，唯一还成立的几何事实是
+// 「插入符在文本框首行的起始处」。按框内左上内缩一个 padding、行高 20dp 画一根，
+// 误差十几个像素，而整框矩形错的是整块控件。
+static void ApproxCaretInBox(const RECT& box, RECT* out) {
+    int pad = S(8);
+    int bw = box.right - box.left, bh = box.bottom - box.top;
+    if (pad * 3 > bw) pad = (std::max)(0, bw / 6);
+    int lh = (std::min)(bh - pad * 2, S(20));
+    if (lh < S(8)) lh = S(8);
+    out->left = box.left + pad;
+    out->right = out->left + 1;
+    out->top = box.top + pad;
+    out->bottom = out->top + lh;
+}
+
+static bool BoxSaneRect(const RECT& b, const RECT& work, HWND target);
+
+static bool UiaCaretRect(HWND target, CaretInfo* info) {
+    IUIAutomation* uia = UiaClient();
+    if (!uia || !target || !IsWindow(target)) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(target, &pid);
+
+    DWORD t0 = GetTickCount();
+    IUIAutomationElement* el = nullptr;
+    if (FAILED(uia->GetFocusedElement(&el)) || !el) { Trace("  uia: no focused element"); return false; }
+
+    int ep = 0;
+    if (FAILED(el->get_CurrentProcessId(&ep)) || !ProcessIsSelfOrDescendant((DWORD)ep, pid)) {
+        // 焦点元素属于别的程序（面板自己、输入法候选窗…）：不是这次要贴的目标
+        Trace("  uia: foreign focus elpid=%d targetpid=%lu", ep, (unsigned long)pid);
+        el->Release();
+        return false;
+    }
+
+    RECT* out = &info->caret;
+    RECT rc{};
+    bool ok = false;
+    bool approx = false;
+
+    // 焦点元素的控件类型决定「GetSelection 能不能信」。
+    // Chromium 里的 input / textarea / contenteditable 分别是 Edit / Edit / Group，
+    // 而焦点落在页面本身（body、页面级快捷键劫持）时是 Document：这种元素的
+    // TextPattern 是整页文本视图，GetSelection 给的是页面里当前那块被选中/被跟踪的内容，
+    // 与插入符无关（实测 bilibili 视频页给回一个 46x46 的方块），采信它面板会贴到乱处。
+    CONTROLTYPEID ct = 0;
+    el->get_CurrentControlType(&ct);
+    bool isDocEl = (ct == UIA_DocumentControlTypeId);
+    // 只对「看起来是文本控件」的类型采信 GetSelection 兜底：Edit / Document / Group / Pane /
+    // Text / Custom（ct==0 表示没读出来，不排除）。列表项、按钮之类即便有 TextPattern 也不算。
+    bool textish = (ct == 0) || ct == UIA_EditControlTypeId || ct == UIA_DocumentControlTypeId ||
+                   ct == UIA_TextControlTypeId || ct == UIA_GroupControlTypeId ||
+                   ct == UIA_PaneControlTypeId || ct == UIA_CustomControlTypeId;
+    bool caretRangeOk = false;
+    bool uiBadCaret = false;
+
+    // 焦点控件整体矩形：既用来让面板别压住输入框本身，也用来识别「插入符矩形
+    // 其实就是整框」这种假数据（见 CaretRectIsBox）。
+    info->hasBox = false;
+    RECT box{};
+    bool boxOk = false;
+    if (!isDocEl && SUCCEEDED(el->get_CurrentBoundingRectangle(&box)) &&
+        box.right > box.left && box.bottom > box.top) {
+        info->box = box;
+        info->hasBox = true;
+        boxOk = true;
+    }
+
+    // 1) TextPattern2::GetCaretRange —— 直接就是插入符，最准
+    IUIAutomationTextPattern2* tp2 = nullptr;
+    if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TextPattern2Id, IID_IUIAutomationTextPattern2,
+                                          (void**)&tp2)) && tp2) {
+        BOOL active = FALSE;
+        IUIAutomationTextRange* range = nullptr;
+        if (SUCCEEDED(tp2->GetCaretRange(&active, &range)) && range) {
+            if (active) {
+                caretRangeOk = UiaRangeRect(range, false, &rc);
+                ok = caretRangeOk;
+                if (ok && boxOk && CaretRectIsBox(rc, box)) {
+                    uiBadCaret = true;   // 回的是整框，不是插入符
+                    ok = false;
+                    caretRangeOk = false;
+                }
+            }
+            range->Release();
+        }
+        tp2->Release();
+    }
+
+    // 2) TextPattern::GetSelection —— 没有 caret range 的控件（老实现、部分 Electron）
+    //    用选区兜底：选区末尾就是插入符所在位置。文档级元素不适用，见上。
+    if (!ok && textish && !isDocEl) {
+        IUIAutomationTextPattern* tp = nullptr;
+        if (SUCCEEDED(el->GetCurrentPatternAs(UIA_TextPatternId, IID_IUIAutomationTextPattern,
+                                              (void**)&tp)) && tp) {
+            IUIAutomationTextRangeArray* arr = nullptr;
+            if (SUCCEEDED(tp->GetSelection(&arr)) && arr) {
+                int n = 0;
+                arr->get_Length(&n);
+                if (n > 0) {
+                    IUIAutomationTextRange* range = nullptr;
+                    if (SUCCEEDED(arr->GetElement(n - 1, &range)) && range) {
+                        ok = UiaRangeRect(range, true, &rc);
+                        if (ok && boxOk && CaretRectIsBox(rc, box)) {
+                            uiBadCaret = true;   // 同上：整框当插入符
+                            ok = false;
+                        }
+                        range->Release();
+                    }
+                }
+                arr->Release();
+            }
+            tp->Release();
+        }
+    }
+    // 3) 通道都给不出可信插入符时，退到「框内近似」。
+    //    内容为空的文本框是所有通道都失效的典型（Chromium 只回整框），但插入符
+    //    必然在首行起始处；框本身可信（不是整窗、不是整页容器）才这么近似，
+    //    否则宁可居中，免得把面板摆到整块控件外面老远。
+    if (!ok && boxOk) {
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        HMONITOR mon = MonitorFromRect(&box, MONITOR_DEFAULTTONEAREST);
+        RECT work{};
+        if (GetMonitorInfoW(mon, &mi)) work = mi.rcWork;
+        if (work.right > work.left && BoxSaneRect(box, work, target)) {
+            ApproxCaretInBox(box, &rc);
+            ok = true;
+            approx = true;
+        }
+    }
+    el->Release();
+
+    Trace("  uia: ok=%d ct=%d caret2=%d bad=%d approx=%d caret=%ld,%ld,%ld,%ld box=%d,%ld,%ld,%ld,%ld cost=%lums",
+          (int)ok, (int)ct, (int)caretRangeOk, (int)uiBadCaret, (int)approx, rc.left, rc.top, rc.right,
+          rc.bottom, (int)info->hasBox, info->box.left, info->box.top, info->box.right, info->box.bottom,
+          (unsigned long)(GetTickCount() - t0));
+    info->approx = approx;
+    if (!ok) return false;
+    if (rc.right - rc.left < 1) rc.right = rc.left + 1;
+    *out = rc;
+    return true;
+}
+
 // ================================================================== 显示 / 隐藏
+
+// 两条通道依次试：原生插入符（GetGUIThreadInfo）→ UIA（浏览器 / Electron）。
+static bool ProbeCaretRaw(HWND target, CaretInfo* ci) {
+    *ci = CaretInfo{};
+    if (!target || !IsWindow(target)) return false;
+    if (CaretRectOf(target, &ci->caret)) {
+        RECT box{};
+        if (FocusBoxOf(target, &box)) { ci->box = box; ci->hasBox = true; }
+        Trace("  caret: ok=%ld,%ld,%ld,%ld box=%d[%ld,%ld,%ld,%ld]", ci->caret.left, ci->caret.top,
+              ci->caret.right, ci->caret.bottom, (int)ci->hasBox,
+              ci->box.left, ci->box.top, ci->box.right, ci->box.bottom);
+        return true;
+    }
+    return UiaCaretRect(target, ci);
+}
+
+static bool ProbeCaret(HWND target, CaretInfo* ci) {
+    if (!ProbeCaretRaw(target, ci)) return false;
+    // Chromium 第一次被 UIA 询问时常常只回「整框」或退化矩形（可访问性树刚被唤醒），
+    // 紧接着再问一次通常就精确了——这次同步重试比等补探定时器好：面板不必先跳一下。
+    if (ci->approx) {
+        CaretInfo again;
+        if (ProbeCaretRaw(target, &again) && !again.approx) *ci = again;
+    }
+    return true;
+}
+
+// 输入控件矩形可不可信。整窗（WPF / WinUI 自绘窗口的焦点控件就是顶层窗口）、
+// 浏览器的整页 document 都会给出一个巨大矩形，拿它避让会把面板推到窗口外面去
+// （实测 Win11 记事本：焦点控件矩形 = 整个窗口，面板于是被摆到窗口下方的空白区），
+// 所以宁缺勿滥：太高的、又宽又高的、跟目标窗口几乎一样大的一律不认。
+static bool BoxSaneRect(const RECT& b, const RECT& work, HWND target) {
+    int bw = b.right - b.left, bh = b.bottom - b.top;
+    if (bw <= 0 || bh <= 0) return false;
+    int ww = work.right - work.left, wh = work.bottom - work.top;
+    if (bh > wh * 2 / 3) return false;
+    if (bw > ww * 3 / 4 && bh > wh / 3) return false;   // 又宽又高：多半是整页容器
+    RECT tw{};
+    if (target && IsWindow(target) && GetWindowRect(target, &tw)) {
+        long long ta = (long long)(tw.right - tw.left) * (tw.bottom - tw.top);
+        long long ba = (long long)bw * bh;
+        bool covers = b.left <= tw.left + 2 && b.top <= tw.top + 2 &&
+                      b.right >= tw.right - 2 && b.bottom >= tw.bottom - 2;
+        if (covers || (ta > 0 && ba * 10 >= ta * 6)) return false;   // 就是整窗本身（6 成面积起算）
+    }
+    return true;
+}
+
+// 面板落点：贴着插入符弹出，并且尽量不压住输入框。
+// 只算「下方放不下就翻到上方」是不够的：面板高 620、屏幕 1440，输入框在屏幕中部时
+// 下方放不下面板，翻到上方又会被工作区上边界钳回来，钳完正好压在输入框上。
+// 这里把所有候选位置都算出来打分：不遮挡 > 完整落在屏幕内 > 遮挡面积小 > 依次偏好
+// （下方、上方、右侧、左侧、贴底、贴顶）。夹取到工作区之后才评分，所以钳取带来的
+// 遮挡也会被计入。
+static POINT PlacePanel(const RECT& work, int w, int h, const RECT& caret, const RECT* avoid) {
+    const int m = S(8), gap = S(8);
+    const RECT& av = avoid ? *avoid : caret;
+    struct Cand { int x, y; bool fits; long long ov; };
+    Cand best{work.left, work.top, false, 0};
+    bool have = false;
+
+    auto consider = [&](int x, int y) {
+        bool fits = x >= work.left + m && x + w <= work.right - m &&
+                    y >= work.top + m && y + h <= work.bottom - m;
+        int cx = x, cy = y;
+        if (cx > work.right - m - w) cx = work.right - m - w;
+        if (cy > work.bottom - m - h) cy = work.bottom - m - h;
+        if (cx < work.left + m) cx = work.left + m;
+        if (cy < work.top + m) cy = work.top + m;
+        int ox = (std::min)((int)av.right, cx + w) - (std::max)((int)av.left, cx);
+        int oy = (std::min)((int)av.bottom, cy + h) - (std::max)((int)av.top, cy);
+        long long ov = (ox > 0 && oy > 0) ? (long long)ox * oy : 0;
+        Cand c{cx, cy, fits, ov};
+        auto better = [](const Cand& a, const Cand& b) {
+            if ((a.ov > 0) != (b.ov > 0)) return a.ov == 0;      // 不遮挡优先
+            if (a.fits != b.fits) return a.fits;                 // 完整在屏幕内优先
+            return a.ov < b.ov;                                  // 遮挡面积小优先
+        };
+        if (!have || better(c, best)) { best = c; have = true; }
+    };
+
+    int x0 = caret.left - S(2);
+    consider(x0, av.bottom + gap);                  // 下方（默认）
+    consider(x0, av.top - gap - h);                 // 上方
+    consider(av.right + gap, caret.top - S(30));    // 右侧
+    consider(av.left - gap - w, caret.top - S(30)); // 左侧
+    consider(x0, work.bottom - m - h);              // 极限贴底：重叠最小
+    consider(x0, work.top + m);                     // 极限贴顶
+    return POINT{best.x, best.y};
+}
+
+// 首次探测不到插入符时的补定位：面板已经显示出来了，这里只挪位置，不碰前台。
+static void MovePanelToCaret(const CaretInfo& ci) {
+    if (!g_panel || !IsWindow(g_panel) || !g_panelW || !g_panelH) return;
+    HMONITOR mon = MonitorFromPoint(POINT{ci.caret.left, ci.caret.top}, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return;
+    const RECT* avoid = (ci.hasBox && BoxSaneRect(ci.box, mi.rcWork, g_target)) ? &ci.box : nullptr;
+    POINT p = PlacePanel(mi.rcWork, g_panelW, g_panelH, ci.caret, avoid);
+    SetWindowPos(g_panel, HWND_TOPMOST, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    Trace("  reposition -> %d,%d (caret %ld,%ld)", p.x, p.y, ci.caret.left, ci.caret.top);
+}
 static void RoundCorners(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     HRGN rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, S(RADIUS), S(RADIUS));
@@ -4512,6 +4966,8 @@ static void RoundCorners(HWND hwnd) {
 
 static void HidePanel() {
     Trace("HidePanel() from %p fg=%p", __builtin_return_address(0), (void*)GetForegroundWindow());
+    bool noRestore = g_hideNoRestore;
+    g_hideNoRestore = false;
     if (g_panel && IsWindowVisible(g_panel)) {
         // 只有输入态（用户点过搜索框）面板才持有前台，那时收起必须把焦点还回原窗口，
         // 否则前台会停在一个不可见的窗口上：原窗口失焦、键盘输入毫无反应。
@@ -4522,7 +4978,12 @@ static void HidePanel() {
         KillTimer(g_panel, TIMER_CARET);
         KillTimer(g_panel, TIMER_FOCUS);
         KillTimer(g_panel, TIMER_EMOJI);
+        KillTimer(g_panel, TIMER_REPROBE);
+        KillTimer(g_panel, TIMER_DEFERHIDE);
+        g_reprobeLeft = 0;
         ShowWindow(g_panel, SW_HIDE);
+        // 面板收起后残留的「已吞 down」标记会让下一次显示吞掉一个孤立的 keyup。
+        for (bool& b : g_swallowed) b = false;
         g_query.clear(); g_comp.clear();
         g_menuOpen = false;
         g_modalOpen = false;
@@ -4532,16 +4993,14 @@ static void HidePanel() {
         // 借用中的剪贴板要还回去（点完表情立刻关面板、没等到还原定时器的情况）
         if (g_borrowedClip) { KillTimer(g_main, TIMER_CLIPRESTORE); RestoreClipboard(); }
         BuildView();
-        if (hadFocus && g_target && g_target != g_panel && IsWindow(g_target)) {
+        if (hadFocus && !noRestore && g_target && g_target != g_panel && IsWindow(g_target)) {
             SetForegroundWindow(g_target);
             RestoreTargetFocus(g_target, g_targetFocus);
         }
     }
 }
 
-// ---- 诊断日志（默认关闭，见下方定义）----
-static void Trace(const char* fmt, ...);
-
+// ---- 诊断日志（默认关闭，声明见文件头部）----
 static void ForceForeground(HWND hwnd);
 
 // 面板该不该继续留在屏幕上。取代了早期那套「失焦就抢回前台」的抢救逻辑——
@@ -4645,13 +5104,13 @@ static void ShowPanel() {
     POINT pt; GetCursorPos(&pt);
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
 
-    RECT caretRect{};
-    bool hasCaret = false;
-    if (g_target && CaretRectOf(g_target, &caretRect)) {
-        hasCaret = true;
-        POINT c{caretRect.left, caretRect.top};
+    CaretInfo ci;
+    bool hasCaret = ProbeCaret(g_target, &ci);
+    if (hasCaret) {
+        POINT c{ci.caret.left, ci.caret.top};
         mon = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);   // 光标可能跨屏
     }
+    Trace("  place: target=%p hasCaret=%d", (void*)g_target, (int)hasCaret);
 
     MONITORINFO mi{}; mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -4671,13 +5130,12 @@ static void ShowPanel() {
     BuildView();
     ComputeLayout();
 
+    g_posUserSet = false;
     int x = 0, y = 0;
     if (hasCaret) {
-        // 左缘大致对齐插入符，落在插入符下方；下方放不下就翻到上方
-        x = caretRect.left - S(2);
-        y = caretRect.bottom + S(8);
-        if (y + h > mi.rcWork.bottom - S(8)) y = caretRect.top - S(8) - h;
-        if (x + w > mi.rcWork.right - S(8)) x = caretRect.right - w;
+        const RECT* avoid = (ci.hasBox && BoxSaneRect(ci.box, mi.rcWork, g_target)) ? &ci.box : nullptr;
+        POINT p = PlacePanel(mi.rcWork, w, h, ci.caret, avoid);
+        x = p.x; y = p.y;
     } else {
         x = mi.rcWork.left + (w < workW ? (workW - w) / 2 : 0);
         y = mi.rcWork.top + (h < workH ? (workH - h) / 2 : 0);
@@ -4694,10 +5152,20 @@ static void ShowPanel() {
     // 目标窗口因此一直持有键盘焦点，插入符一直闪——系统 Win+V 面板就是这么做的。
     // 面板要用到的按键由低级键盘钩子转发进来（见 LLKeyboard）。
     SetWindowPos(g_panel, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    Trace("  place x=%d y=%d w=%d h=%d caret=%ld,%ld avoid=%d", x, y, w, h, ci.caret.left, ci.caret.top,
+          (int)(hasCaret && ci.hasBox && BoxSaneRect(ci.box, mi.rcWork, g_target)));
     Trace("  after SWP_SHOWWINDOW fg=%p vis=%d", (void*)GetForegroundWindow(), (int)IsWindowVisible(g_panel));
     RoundCorners(g_panel);
     SetTimer(g_panel, TIMER_CARET, 530, nullptr);
     SetTimer(g_panel, TIMER_FOCUS, 120, nullptr);
+    // 缺插入符、或只拿到「框内近似」时补探：Chromium / Electron 的可访问性树是懒建的，
+    // 刚被唤醒的头一次询问经常只回整框或退化矩形（网页输入框就是这样时有时无）。
+    // 面板先按近似/居中显示，随后补探成功就挪到光标旁边——只挪位置，不碰前台。
+    if ((!hasCaret || ci.approx) && g_target && IsWindow(g_target) && g_target != g_panel &&
+        g_target != g_main) {
+        g_reprobeLeft = 2;
+        SetTimer(g_panel, TIMER_REPROBE, 140, nullptr);
+    }
     Redraw();
 }
 
@@ -4722,6 +5190,32 @@ static wchar_t VkToChar(DWORD vk, DWORD scan) {
     wchar_t buf[8] = {};
     int n = ToUnicodeEx(vk, scan, ks, buf, 8, 0, GetKeyboardLayout(0));
     return (n == 1) ? buf[0] : 0;      // n<0：死键，n>1：多字符序列，都不处理
+}
+
+// 非激活态下这个裸键要不要从系统手里接管。
+//
+// 判据必须收得窄，这是硬约束：WH_KEYBOARD_LL 是一条串行链，回调里 return 1
+// 不只挡住目标窗口，还会让排在后面的**所有**低级键盘钩子——别的软件的全局
+// 热键、输入法、AutoHotkey / Quicker 这类按键工具——根本收不到这一次按键。
+// 早期版本「面板可见就接管全部非修饰键」，于是面板一弹出来，别家的键盘快捷键
+// 就全哑了。现在只接面板确实会消费的键：
+//   · Esc（唯一的键盘关闭键）、Tab（切页签）；
+//   · 列表页的方向/翻页/删除、以及确认键；
+//   · 能打出可见字符的键（非激活态直接打字进搜索框，这是核心体验）。
+// 其余一律放行：功能键、媒体键、PrintScreen、Home/End/Insert、面板不处理的
+// 导航键。带 Ctrl 的组合也整个放行——Ctrl+S / Ctrl+F / Ctrl+C 属于前台程序，
+// 面板不该抢（代价是非激活态的 Ctrl+1..4 / P / D / S 快捷键不再生效，只在
+// 点过搜索框的输入态可用）。
+static bool PanelConsumesBareKey(DWORD vk, wchar_t ch) {
+    if (vk == VK_ESCAPE) return true;
+    if (vk == VK_TAB)    return true;
+    if (g_modalOpen || g_menuOpen)
+        return vk == VK_RETURN || vk == VK_UP || vk == VK_DOWN;
+    if (vk == VK_RETURN) return g_page == PG_HISTORY || g_page == PG_FAV;
+    if (vk == VK_BACK)   return !g_query.empty();
+    if (vk == VK_UP || vk == VK_DOWN || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_DELETE)
+        return g_page == PG_HISTORY || g_page == PG_FAV;
+    return ch != 0;
 }
 
 static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
@@ -4772,7 +5266,9 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
         }
 
         // ---- 面板打开期间的按键转发 ----
-        // 命中条件：面板可见、且前台不是面板自己（输入态下按键本来就直达面板）。
+        // 命中条件：面板可见、前台不是面板自己（输入态下按键本来就直达面板）、
+        // 并且这个键面板确实要消费（见 PanelConsumesBareKey，判据必须窄——
+        // 多吞一个键，别家软件的全局热键就少收一个键）。
         // 修饰键一律放行，两个原因缺一不可：
         //   1) Win / Alt 组合要交给系统（Win+D、Alt+Tab、Alt+F4）——判据看自跟踪的
         //      g_lwin/g_rwin 与 LLKHF_ALTDOWN；
@@ -4789,17 +5285,93 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
         if (g_panel && IsWindowVisible(g_panel) && GetForegroundWindow() != g_panel &&
             k->dwExtraInfo != g_injectMark && !isModifier &&
             !(g_lwin || g_rwin) && !(k->flags & LLKHF_ALTDOWN)) {
-            if (down) {
-                bool ctrl = g_ctrlDown;
-                wchar_t ch = ctrl ? 0 : VkToChar(vk, k->scanCode);
-                // SendMessage 而不是 PostMessage：钩子就跑在本进程 UI 线程上，
-                // 同线程 SendMessage 是直接调用，没有跨线程等待，也就不会拖慢输入。
-                SendMessageW(g_panel, WM_APP_PANELKEY, (WPARAM)vk, MAKELPARAM(ctrl ? 1 : 0, ch));
+            if (up) {
+                // 吞了 down 就必须吞同一次按键的 up，目标窗口才收不到半截按键。
+                if (g_swallowed[vk & 0xFF]) {
+                    g_swallowed[vk & 0xFF] = false;
+                    return 1;
+                }
+            } else if (down) {
+                // 带 Ctrl 的组合整个放行：面板不抢前台程序的快捷键，也让排在
+                // 钩子链后面的别家钩子能收到（代价见 PanelConsumesBareKey 的注释）。
+                wchar_t ch = 0;
+                if (!g_ctrlDown) {
+                    if ((vk == 0 || vk == VK_PACKET) && (k->flags & LLKHF_INJECTED)) {
+                        // KEYEVENTF_UNICODE 的注入事件：vk 被系统填成 VK_PACKET(0xE7)
+                        // （个别路径是 0），码元在 scanCode 里。自动化脚本就是这样往
+                        // 面板里打字的，真人键盘不会产生 VK_PACKET。
+                        ch = (wchar_t)k->scanCode;
+                    } else {
+                        ch = VkToChar(vk, k->scanCode);
+                    }
+                }
+                if (!g_ctrlDown && PanelConsumesBareKey(vk, ch)) {
+                    g_swallowed[vk & 0xFF] = true;
+                    // SendMessage 而不是 PostMessage：钩子就跑在本进程 UI 线程上，
+                    // 同线程 SendMessage 是直接调用，没有跨线程等待，也就不会拖慢输入。
+                    SendMessageW(g_panel, WM_APP_PANELKEY, (WPARAM)vk, MAKELPARAM(0, ch));
+                    return 1;
+                }
+                // 面板不消费的键落到下面 CallNextHookEx：直接放行给目标窗口和
+                // 后面的钩子，等于面板没打开时的行为。
             }
-            return 1;   // down/up 一起吞，目标窗口不会收到半截按键
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// 点面板外部即收起。
+// 为什么必须有这条：非激活态下面板从不夺取前台，所以「在同一个窗口里点掉面板」
+// （最典型的是在浏览器里点正文/地址栏、在记事本里点正文后继续打字）根本不产生
+// 前台变化——PanelShouldStay 的轮询看不到任何东西，面板就僵在屏幕上，直到用户
+// 切到别的窗口或再按一次热键。系统 Win+V 面板没这问题是因为它自己是激活窗口，
+// 一点别处就收到 WA_INACTIVE；我们保持不抢焦点，就得自己盯鼠标。
+// 只看「按下的点是否在面板矩形内」，与前台轮询互补；自己注入的鼠标事件跳过。
+static LRESULT CALLBACK LLMouse(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && g_panel && IsWindowVisible(g_panel) &&
+        !g_pinned && !g_dialogOpen && !g_dragging && !g_resizing) {
+        bool down = (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN);
+        if (down) {
+            const MSLLHOOKSTRUCT* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+            // 注意：不能用 LLMHF_INJECTED 过滤——自动化脚本（SetCursorPos + mouse_event）
+            // 的点击也是注入事件，过滤掉就等于「脚本点别处不收起」。只认自己的魔数。
+            if (ms && ms->dwExtraInfo != g_injectMark) {
+                POINT pt = ms->pt;
+                RECT r{};
+                if (GetWindowRect(g_panel, &r) &&
+                    !(pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom)) {
+                    // 本进程自己的窗口（另存为对话框、消息框）不算「外部」，否则一开
+                    // 对话框面板就被自己收掉了。
+                    HWND at = WindowFromPoint(pt);
+                    DWORD pid = 0;
+                    if (at) GetWindowThreadProcessId(at, &pid);
+                    if (!at || pid != GetCurrentProcessId()) {
+                        HWND root = at ? GetAncestor(at, GA_ROOT) : nullptr;
+                        HWND tgtRoot = (g_target && IsWindow(g_target))
+                                       ? GetAncestor(g_target, GA_ROOT) : g_target;
+                        bool other = (root && tgtRoot && root != tgtRoot);
+                        // 输入态下面板自己是前台：这时点去别的窗口，收起必须让位给
+                        // 那次点击的激活——我们先隐藏的话，系统会把前台随手交给
+                        // Z 序下一个窗口（实测交给上一个记事本），用户点的窗口反而
+                        // 抢不到前台。所以这种情形交给前台变化轮询去收（120ms 内），
+                        // HidePanel 那时看到前台已不是自己，自然不会去抢。
+                        if (other && GetForegroundWindow() == g_panel) {
+                            Trace("hook: mouse down on other window (pt=%ld,%ld) -> defer to poll", pt.x, pt.y);
+                            return CallNextHookEx(g_mouseHook, code, wp, lp);
+                        }
+                        Trace("hook: mouse down outside panel (pt=%ld,%ld) root=%p -> hide",
+                              pt.x, pt.y, (void*)root);
+                        // 不吞这次点击：用户点哪儿就是要操作哪儿，面板只是让开。
+                        // 钩子跑在 UI 线程上，PostMessage 到同线程窗口不会重入。
+                        // 点的不是唤起的那个窗口（或点空）时不许抢前台，见 g_hideNoRestore；
+                        // 这里把点击处的顶层窗口带过去，由它和目标窗口比对。
+                        PostMessageW(g_panel, WM_APP_HIDE_OUTSIDE, (WPARAM)root, 0);
+                    }
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_mouseHook, code, wp, lp);
 }
 
 // ================================================================== 托盘
@@ -4973,6 +5545,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
                     L"WinVClip", MB_ICONERROR);
         return 1;
     }
+    // 鼠标钩子只用来「点外面就收起」，装不上不影响主功能（面板仍能靠前台轮询，
+    // 只是同窗口内点击收不起来），所以失败不报错。
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouse, GetModuleHandleW(nullptr), 0);
 
     AddTray();
     SetTimer(g_main, TIMER_WARM, 120, nullptr);   // 启动后就把字形图集准备好
@@ -4991,6 +5566,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     StopEmojiWorker();        // 工作线程必须在 D2D/atlas 释放之前停掉
     ReleaseEmojiCache();
     UnhookWindowsHookEx(g_hook);
+    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     RemoveClipboardFormatListener(g_main);
     HFONT* all[] = {&g_fTitle, &g_fMeta, &g_fTab, &g_fChip, &g_fSearch, &g_fMono,
                     &g_fEmoji, &g_fSym, &g_fKbd, &g_fBig, &g_fToast, &g_fSymName};

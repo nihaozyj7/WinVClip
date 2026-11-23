@@ -1,0 +1,11 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>caret probe2</title>
+<style>body{font:16px sans-serif;margin:40px}input,div[contenteditable],textarea{font:16px sans-serif;padding:8px;display:block;margin:18px 0;width:520px;border:2px solid #888}iframe{width:560px;height:120px;border:2px solid #c00}</style>
+</head><body>
+<p>插入符探针页 v2</p>
+<input id="a" value="hello world" autofocus placeholder="plain input">
+<div id="b" contenteditable="true">editable div text</div>
+<textarea id="c" rows="2" cols="50">textarea</textarea>
+<iframe id="f" srcdoc='&lt;input id="ia" value="iframe input" style="font:16px sans-serif;padding:8px;width:480px"&gt;'></iframe>
+<script>document.getElementById('a').focus();</script>
+</body></html>

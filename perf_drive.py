@@ -38,7 +38,7 @@ def main():
     if what == "sym":
         click(hwnd, 313, 20)
     elif what == "emo":
-        click(hwnd, 235, 20)
+        click(hwnd, 184, 20)
     elif what == "hist":
         click(hwnd, 100, 20)
     elif what == "cats":
