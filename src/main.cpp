@@ -83,7 +83,7 @@ enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
 
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10 };
 enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
-       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108 };
+       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108, TIMER_CLIPRESTORE = 0x109 };
 
 // ================================================================== 数据
 
@@ -204,6 +204,20 @@ static int  g_modalRow = -1;
 static bool g_pinned = false;        // 临时固定：本次显示期间不失焦隐藏 + 置顶，关闭后自动取消
 static std::wstring g_typePending;   // 待注入的文本（表情/符号直插，不经剪贴板）
 
+// 「临时借用剪贴板」：给不接受字符注入的目标窗口准备的粘贴通道。
+// 借用期间把原剪贴板内容备份下来，粘完还原；借用产生的剪贴板变化不进历史。
+struct ClipBak {
+    bool valid = false;
+    bool hadText = false;
+    std::wstring text;
+    std::vector<std::wstring> files;
+    std::vector<BYTE> png, dib;
+};
+static ClipBak g_clipBak;
+static bool    g_borrowedClip = false;   // 正在借用中（备份已做、尚未还原）
+// 我方最后一次写剪贴板产生的序列号：既用于跳过「自己写的」捕获，也用于还原前的安全检查
+static DWORD   g_selfClipSeq = 0;
+
 // 面板尺寸：g_panelW/H 是本次显示的实际值，g_savedW/H 是上次调整后落盘的值
 static int g_panelW = 0, g_panelH = 0;
 static int g_savedW = 0, g_savedH = 0;
@@ -216,9 +230,6 @@ enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
 static bool g_caretOn = true;
 static int  g_gridScroll = 0;      // 表情/符号页的纵向滚动（像素）
 
-// 目标窗口能否接收文本输入。非激活态下目标窗口一直持有焦点，随时可查；
-// 仍然缓存一份，供「唤起时刻」与固定态切换目标时判断。
-static bool     g_targetTyping = false;
 // 面板是否处于「输入态」：见文件开头焦点模型的说明
 static bool     g_inputMode = false;
 // 钩子转发给面板的按键消息（wParam=vk，lParam=MAKELPARAM(ctrl, ch)）
@@ -1968,6 +1979,12 @@ static std::wstring ForegroundSource() {
 }
 
 static void CaptureClipboard() {
+    // 自己写进去的内容（借用剪贴板粘贴表情/符号、或还原备份）不进历史，
+    // 否则每点一个表情，历史里就多一条孤零零的 emoji。
+    {
+        DWORD seq = GetClipboardSequenceNumber();
+        if (g_selfClipSeq && seq == g_selfClipSeq) return;
+    }
     if (!OpenClipboard(g_main)) { SetTimer(g_main, TIMER_CLIP, 160, nullptr); return; }
 
     ClipItem it;
@@ -2164,6 +2181,107 @@ static void PutText(const std::wstring& s) {
         if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
     }
     CloseClipboard();
+}
+
+// 备份当前剪贴板（只备内容型格式：文本 / 文件列表 / PNG / DIB）。
+// 目的：给「取不到插入符」的目标窗口走 Ctrl+V 通道时，粘完还能把用户原来的
+// 剪贴板还回去 —— 点一个表情不该留下痕迹。
+static void BorrowClipboard() {
+    if (g_borrowedClip) return;      // 连续点多个字形：只备份第一次，别把上一次的临时内容当成原内容
+    g_clipBak = ClipBak{};
+    if (!OpenClipboard(g_main)) { g_borrowedClip = true; return; }
+
+    HANDLE h = nullptr;
+    if ((h = GetClipboardData(CF_UNICODETEXT)) != nullptr) {
+        if (auto* p = (const wchar_t*)GlobalLock(h)) {
+            g_clipBak.hadText = true;
+            g_clipBak.text = p;
+            GlobalUnlock(h);
+        }
+    }
+    if (!g_clipBak.hadText && (h = GetClipboardData(CF_HDROP)) != nullptr) {
+        UINT n = DragQueryFileW((HDROP)h, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < n && n < 1000; ++i) {
+            UINT len = DragQueryFileW((HDROP)h, i, nullptr, 0);
+            std::wstring s(len + 1, L'\0');
+            DragQueryFileW((HDROP)h, i, &s[0], len + 1);
+            s.resize(len);
+            g_clipBak.files.push_back(s);
+        }
+    }
+    if (!g_clipBak.hadText && g_clipBak.files.empty()) {
+        if (g_cfPng && (h = GetClipboardData(g_cfPng)) != nullptr) {
+            SIZE_T sz = GlobalSize(h);
+            if (auto* p = (const BYTE*)GlobalLock(h)) {
+                if (sz > 32 && sz < 32u * 1024 * 1024) g_clipBak.png.assign(p, p + sz);
+                GlobalUnlock(h);
+            }
+        } else if ((h = GetClipboardData(CF_DIB)) != nullptr) {
+            SIZE_T sz = GlobalSize(h);
+            if (auto* p = (const BYTE*)GlobalLock(h)) {
+                if (sz > sizeof(BITMAPINFOHEADER) && sz < 32u * 1024 * 1024)
+                    g_clipBak.dib.assign(p, p + sz);
+                GlobalUnlock(h);
+            }
+        }
+    }
+    CloseClipboard();
+    g_clipBak.valid = true;
+    g_borrowedClip = true;
+}
+
+// 还原备份。安全前提：剪贴板里还是我们自己写的那份（序列号比对），
+// 期间若有别人复制过东西就放弃还原，绝不覆盖新内容。
+static void RestoreClipboard() {
+    if (!g_borrowedClip) return;
+    g_borrowedClip = false;
+    if (g_clipBak.valid && (!g_selfClipSeq || GetClipboardSequenceNumber() == g_selfClipSeq) &&
+        OpenClipboard(g_main)) {
+        EmptyClipboard();
+        if (g_clipBak.hadText) {
+            size_t bytes = (g_clipBak.text.size() + 1) * sizeof(wchar_t);
+            if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+                void* p = GlobalLock(h);
+                memcpy(p, g_clipBak.text.c_str(), bytes);
+                GlobalUnlock(h);
+                if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+            }
+        } else if (!g_clipBak.files.empty()) {
+            size_t chrs = 1;
+            for (auto& f : g_clipBak.files) chrs += f.size() + 1;
+            size_t total = sizeof(DROPFILES) + chrs * sizeof(wchar_t);
+            if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total)) {
+                auto* df = (DROPFILES*)GlobalLock(h);
+                df->pFiles = sizeof(DROPFILES);
+                df->fWide = TRUE;
+                auto* p = (wchar_t*)((BYTE*)df + sizeof(DROPFILES));
+                for (auto& f : g_clipBak.files) {
+                    memcpy(p, f.c_str(), (f.size() + 1) * sizeof(wchar_t));
+                    p += f.size() + 1;
+                }
+                *p = 0;
+                GlobalUnlock(h);
+                if (!SetClipboardData(CF_HDROP, h)) GlobalFree(h);
+            }
+        } else if (!g_clipBak.png.empty() && g_cfPng) {
+            if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, g_clipBak.png.size())) {
+                void* p = GlobalLock(h);
+                memcpy(p, g_clipBak.png.data(), g_clipBak.png.size());
+                GlobalUnlock(h);
+                if (!SetClipboardData(g_cfPng, h)) GlobalFree(h);
+            }
+        } else if (!g_clipBak.dib.empty()) {
+            if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, g_clipBak.dib.size())) {
+                void* p = GlobalLock(h);
+                memcpy(p, g_clipBak.dib.data(), g_clipBak.dib.size());
+                GlobalUnlock(h);
+                if (!SetClipboardData(CF_DIB, h)) GlobalFree(h);
+            }
+        }
+        g_selfClipSeq = GetClipboardSequenceNumber();   // 还原动作本身也不该进历史
+        CloseClipboard();
+    }
+    g_clipBak = ClipBak{};
 }
 
 // ================================================================== 视图
@@ -3316,7 +3434,6 @@ static void RestoreTargetFocus(HWND target, HWND focus);
 static void ShowPanel();
 static void PasteItem(int vi);
 static void ForceForeground(HWND hwnd);
-static bool AppAcceptsTyping(HWND wnd);
 static bool CaretRectOf(HWND wnd, RECT* out);
 
 static void Toast(const std::wstring& msg, bool info = false) {
@@ -3376,31 +3493,45 @@ static void PasteItem(int vi) {
     }
 }
 
-// 表情 / 符号点击：直接插入到目标窗口，全程不经过剪贴板。
-// 以往这里是 PutText + toast「已复制到剪贴板」，两个后果都很糟：
-// 一是每点一个字形就把用户的剪贴板顶掉，二是历史里被塞满一堆表情。
+// 表情 / 符号点击：把字形送进目标窗口。有两条通道，选哪条看能不能读到目标的文本插入符。
+// 以往这里是 PutText + toast「已复制到剪贴板」，每点一个字形就把用户的剪贴板顶掉，
+// 历史里也被塞满一堆表情——所以能直插的场合一律不碰剪贴板。
 static void PasteGlyph(int page, const GItem& it) {
     AddRecentGlyph(page, it);
     if (CurGlyphCat(page) <= 0) ComputeLayout();   // 「最近使用」页插入后重排
 
+    std::wstring ch = U8N(it.g, it.gl);
     HWND target = g_target;
     if (target && IsWindow(target) && target != g_panel) {
-        if (!g_targetTyping && !AppAcceptsTyping(target)) {
-            // 资源管理器文件列表、桌面这类没有文本输入区的地方：字符注入进去插不进任何东西，
-            // 还会让 Shell 的键入查找响一声系统提示音，所以直接拒绝并说清原因。
-            // 判据优先用唤起面板时缓存的值——那时目标窗口还持有焦点，caret 是真的。
-            Toast(L"当前窗口不接受文本输入");
-            Redraw();
-            return;
-        }
+        // 通道选择（这里是兼容性的关键，别再用「有没有插入符」当能不能插的判据）：
+        //   A. 目标有文本插入符（记事本/Edit/RichEdit/Office 这类标准输入控件）
+        //      → KEYEVENTF_UNICODE 直插，完全不碰剪贴板。
+        //   B. 取不到插入符（Chromium/Electron、UWP、终端、shell 列表）
+        //      → 借剪贴板 + Ctrl+V。这类程序的插入符在渲染进程里，GetGUIThreadInfo
+        //        根本看不到，但「看不见插入符」不等于「不能粘」：Edge 地址栏就是典型，
+        //        早期版本在这里直接拒绝，于是出现「系统剪贴板能粘、我们的表情点不动」。
+        //        Ctrl+V 对所有这类目标都成立，系统 Win+V 面板走的也是这条路。
+        // 资源管理器文件列表这类真的没有文本输入区的地方走 B 也不会响铃：
+        // Ctrl+V 对文本剪贴板是无操作（而字符注入会被 Shell 当成键入查找，响一声提示音）。
+        RECT cr{};
+        bool canInject = CaretRectOf(target, &cr);
+        bool usePaste = g_shiftDown || !canInject;   // Shift = 强制走粘贴，用户的手动兜底
+
         if (!g_pinned) HidePanel();      // 固定态保留面板，便于连续插入
         g_pasteTarget = target;
-        g_typePending = U8N(it.g, it.gl);
+        if (usePaste) {
+            g_typePending.clear();
+            BorrowClipboard();
+            PutText(ch);
+            g_selfClipSeq = GetClipboardSequenceNumber();
+        } else {
+            g_typePending = ch;
+        }
         if (GetForegroundWindow() != target) SetForegroundWindow(target);
         SetTimer(g_main, TIMER_PASTE, 90, nullptr);
     } else {
         // 没有可插入的目标窗口（比如在桌面上唤起面板）：退回复制，至少不会「点了没反应」
-        PutText(U8N(it.g, it.gl));
+        PutText(ch);
         if (g_pinned) Redraw();
         Toast(L"没有可插入的窗口，已复制");
     }
@@ -4342,13 +4473,6 @@ static bool CaretRectOf(HWND wnd, RECT* out) {
     return true;
 }
 
-// 有插入符就认为能接收文本输入。这个判据比猜窗口类名可靠得多：
-// 资源管理器文件列表没有 caret，它的地址栏有。
-static bool AppAcceptsTyping(HWND wnd) {
-    RECT rc{};
-    return CaretRectOf(wnd, &rc);
-}
-
 // ================================================================== 显示 / 隐藏
 static void RoundCorners(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
@@ -4375,6 +4499,8 @@ static void HidePanel() {
         g_toastOn = false;
         g_pinned = false;        // 临时固定只在本次显示期间有效，关闭即取消
         g_inputMode = false;
+        // 借用中的剪贴板要还回去（点完表情立刻关面板、没等到还原定时器的情况）
+        if (g_borrowedClip) { KillTimer(g_main, TIMER_CLIPRESTORE); RestoreClipboard(); }
         BuildView();
         if (hadFocus && g_target && g_target != g_panel && IsWindow(g_target)) {
             SetForegroundWindow(g_target);
@@ -4496,7 +4622,6 @@ static void ShowPanel() {
         POINT c{caretRect.left, caretRect.top};
         mon = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);   // 光标可能跨屏
     }
-    g_targetTyping = hasCaret;            // 点击插入时的判据，见 PasteGlyph
 
     MONITORINFO mi{}; mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -4712,16 +4837,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
                     for (auto& x : in) MarkMine(x);
                     SendInput(4, in, sizeof(INPUT));
+                    // 借来的剪贴板要还：给目标一点时间真正读出剪贴板内容再还原，
+                    // 太早还原会让部分程序（异步读剪贴板的）粘到旧内容。
+                    if (g_borrowedClip) SetTimer(g_main, TIMER_CLIPRESTORE, 600, nullptr);
                 }
                 g_inputMode = false;   // 注入完回到非激活态，焦点继续留在目标窗口
             }
+        } else if (wp == TIMER_CLIPRESTORE) {
+            KillTimer(hwnd, TIMER_CLIPRESTORE);
+            RestoreClipboard();
         }
         return 0;
 
     case WM_CLIPBOARDUPDATE:
         OnClipboardChanged();
         return 0;
-
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_LBUTTONUP) {
             if (IsWindowVisible(g_panel)) HidePanel(); else ShowPanel();
