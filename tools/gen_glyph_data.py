@@ -22,6 +22,21 @@ import sys
 #          I\tGLYPH\tZH\tEN         条目（ZH 中文名 / EN 英文名，用于搜索）
 SYM_HEADER = ("SYM\t1\tdomain\n", "SYM\t2\tcat\n")
 
+# 表情分类名统一成两个字：分类条 chip 与抽屉按钮的宽度都是按两字设计的，
+# 参考页面里的「表情情绪 / 人物身体 / 旅行地点」这类四字名会把 chip 撑开、
+# 并在窄面板下挤掉别的 chip。按 key 映射，未列出的分类保持原名。
+EMO_NAME = {
+    'smileys':  '情绪',
+    'people':   '人物',
+    'nature':   '动物',
+    'food':     '食物',
+    'act':      '活动',
+    'travel':   '旅行',
+    'objects':  '物品',
+    'symbols':  '符号',
+    'flags':    '旗帜',
+}
+
 HEX = set('0123456789abcdefABCDEF')
 
 
@@ -125,7 +140,8 @@ def build_emoji(path):
     for c in d['cats']:
         if c['k'] == 'recent':
             continue
-        lines.append('C\t%s\t%s\n' % (check_field(c['k'], 'k'), check_field(c['n'], 'n')))
+        name = EMO_NAME.get(c['k'], c['n'])
+        lines.append('C\t%s\t%s\n' % (check_field(c['k'], 'k'), check_field(name, 'n')))
         for it in c['items']:
             en = it[2] if len(it) > 2 else ''
             lines.append('I\t%s\t%s\t%s\n' % (check_field(it[0], 'g'),

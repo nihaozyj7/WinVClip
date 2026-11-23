@@ -71,8 +71,9 @@ static const int FILTER_H    = 46;
 static const int FOOT_H      = 38;
 static const int ROW_H       = 56;
 static const int RADIUS      = 12;
-// 面板尺寸可调：最小尺寸由「页签 + 三个按钮排得开」和「至少露出两行」定
-static const int MIN_W       = 460;
+// 面板尺寸可调：最小尺寸由「页签 + 三个按钮排得开」和「至少露出两行」定。
+// 宽度下限压到 360 后页签放不下自然宽度，ComputeLayout 里会按可用宽度均分。
+static const int MIN_W       = 360;
 static const int MIN_H       = 340;
 static const int RESIZE_EDGE = 5;     // 边缘可抓取的带宽（px）
 
@@ -2348,7 +2349,7 @@ static Layout L;
 
 static void ComputeDrawer();
 
-static const wchar_t* TAB_NAME[4] = {L"剪贴板历史", L"收藏", L"表情", L"符号"};
+static const wchar_t* TAB_NAME[4] = {L"剪贴板", L"收藏", L"表情", L"符号"};
 static const wchar_t* FILTER_NAME[4] = {L"全部", L"文本", L"图片", L"其他"};
 
 static void ComputeLayout() {
@@ -2360,19 +2361,38 @@ static void ComputeLayout() {
     L.head = {0, 0, W, S(HEAD_H)};
     L.logo = {S(12), S((HEAD_H - 26) / 2), S(12) + S(26), S((HEAD_H - 26) / 2) + S(26)};
 
-    // 页签：紧接 logo
-    int x = S(12) + S(26) + S(10);
-    for (int i = 0; i < 4; ++i) {
-        int w = TextW(g_fTab, TAB_NAME[i]) + S(30);
-        L.tab[i] = {x, 0, x + w, S(HEAD_H)};
-        x += w + S(4);
-    }
-
     // 右上三个按钮：临时固定 / 设置 / 关闭（与标题栏等高，关闭按钮贴右缘）
+    // 先算按钮，页签才知道自己能用多宽
     int btnW = S(30);
     L.closeB = {W - btnW, 0, W, S(HEAD_H)};
     L.gear   = {L.closeB.left - btnW, 0, L.closeB.left, S(HEAD_H)};
     L.pinB   = {L.gear.left - btnW, 0, L.gear.left, S(HEAD_H)};
+
+    // 页签：紧接 logo，右边界顶到固定按钮左侧。
+    // 宽度下限压到 360 后四个页签的自然宽度放不下，此时按可用宽度均分，
+    // 否则「剪贴板」会顶到图钉按钮底下，或者页签互相压住。
+    int tabGap = S(4);
+    int x0 = S(12) + S(26) + S(10);
+    int avail = L.pinB.left - S(6) - x0;
+    int nat[4], total = tabGap * 3;
+    for (int i = 0; i < 4; ++i) {
+        nat[i] = TextW(g_fTab, TAB_NAME[i]) + S(30);
+        total += nat[i];
+    }
+    int x = x0;
+    if (total <= avail) {
+        for (int i = 0; i < 4; ++i) {
+            L.tab[i] = {x, 0, x + nat[i], S(HEAD_H)};
+            x += nat[i] + tabGap;
+        }
+    } else {
+        int each = (avail - tabGap * 3) / 4;
+        if (each < S(30)) each = S(30);
+        for (int i = 0; i < 4; ++i) {
+            L.tab[i] = {x, 0, x + each, S(HEAD_H)};
+            x += each + tabGap;
+        }
+    }
 
     int sy = S(HEAD_H + SEARCH_TOP);
     L.searchBox = {S(SEARCH_PADX), sy, W - S(SEARCH_PADX), sy + S(SEARCH_H)};
@@ -2784,7 +2804,7 @@ static void PaintFilters(HDC dc) {
 
     const wchar_t* pageName = (g_page == PG_FAV) ? L"收藏"
                             : (g_page == PG_EMOJI) ? L"表情"
-                            : (g_page == PG_SYMBOL) ? L"符号" : L"历史";
+                            : (g_page == PG_SYMBOL) ? L"符号" : L"剪贴板";
     const wchar_t* grp = ((g_page == PG_EMOJI || g_page == PG_SYMBOL) && !g_query.empty())
                        ? L"搜索" : pageName;
     std::wstring label = std::wstring(grp) + L" · " + std::to_wstring(PageCount());
@@ -2873,6 +2893,9 @@ static void PaintRow(HDC dc, int i) {
 
     std::wstring meta = it.tag + L" · 来源：" + it.source;
     RECT mR = metaR; mR.right = rtR.left - S(8);
+    // 面板压到很窄时右侧「大小 - 时间」会吃掉大半行宽，左边界必须夹住，
+    // 否则 right < left 交给 DirectWrite 会画出乱码般的裁切结果
+    if (mR.right < lx + S(20)) mR.right = lx + S(20);
     TextOutF(dc, g_fMeta, C_MUTED, meta, mR, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_LEFT);
 }
 
@@ -3121,20 +3144,8 @@ static void PaintFoot(HDC dc) {
 
     struct H { const wchar_t* key; const wchar_t* label; };
     H hints[] = {{L"↑ ↓", L"选择"}, {L"Enter", L"粘贴"}, {L"P", L"置顶"}, {L"Esc", L"关闭"}};
-    int x = S(16);
-    int cy = L.foot.top + S(FOOT_H) / 2;
-    for (auto& h : hints) {
-        int kw = TextW(g_fKbd, h.key) + S(10);
-        RECT kr{x, cy - S(9), x + kw, cy + S(9)};
-        FillRound(dc, kr, S(4), C_SURFACE, C_LINE);
-        TextOutF(dc, g_fKbd, C_INK, h.key, kr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-        int lx = kr.right + S(5);
-        int lw = TextW(g_fMeta, h.label);
-        RECT lr{lx, L.foot.top, lx + lw + S(2), L.foot.bottom};
-        TextOutF(dc, g_fMeta, C_MUTED, h.label, lr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-        x = lr.right + S(14);
-    }
 
+    // 右侧计数先算出来，提示串才知道自己能用多宽
     std::wstring cnt;
     if (g_page == PG_EMOJI) {
         cnt = std::to_wstring(PageCount()) + L" 个表情";
@@ -3149,6 +3160,25 @@ static void PaintFoot(HDC dc) {
             if (fav) cnt += L" · " + std::to_wstring(fav) + L" 收藏";
         }
     }
+    int cntW = TextW(g_fMeta, cnt);
+    int limit = L.W - S(16) - cntW - S(12);   // 提示串右边界：留 12px 不和计数挨上
+
+    int x = S(16);
+    int cy = L.foot.top + S(FOOT_H) / 2;
+    for (auto& h : hints) {
+        int kw = TextW(g_fKbd, h.key) + S(10);
+        int lw = TextW(g_fMeta, h.label);
+        // 窄面板装不下全部提示，放不下的直接不画（右侧计数优先保留）
+        if (x + kw + S(5) + lw + S(2) > limit) break;
+        RECT kr{x, cy - S(9), x + kw, cy + S(9)};
+        FillRound(dc, kr, S(4), C_SURFACE, C_LINE);
+        TextOutF(dc, g_fKbd, C_INK, h.key, kr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        int lx = kr.right + S(5);
+        RECT lr{lx, L.foot.top, lx + lw + S(2), L.foot.bottom};
+        TextOutF(dc, g_fMeta, C_MUTED, h.label, lr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        x = lr.right + S(14);
+    }
+
     RECT cr{S(16), L.foot.top, L.W - S(16), L.foot.bottom};
     TextOutF(dc, g_fMeta, C_MUTED, cnt, cr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
 }
@@ -4880,7 +4910,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ================================================================== 静态数据
 // 字形库在启动时只解析分类表（几十行），条目索引按分类惰性建立。
-// 默认分类沿用参考页面：符号停在「常用」（quick 大类），表情停在「表情情绪」。
+// 默认分类沿用参考页面：符号停在「常用」（quick 大类），表情停在「情绪」。
 static void InitData() {
     GlyphParseTable(glyphdata::kSymBlob, true);
     GlyphParseTable(glyphdata::kEmoBlob, false);

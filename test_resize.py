@@ -125,10 +125,10 @@ def main():
     W3, H3 = r.right - r.left, r.bottom - r.top
     print("after corner: %dx%d  (expect %dx%d)" % (W3, H3, W2 + 60, H2 + 40))
 
-    # 3) 反向拖右边缘到极小 → 应停在最小宽度 460
+    # 3) 反向拖右边缘到极小 → 应停在最小宽度 360
     drag(h, W3 - 2, H3 // 2, W3 - 2 - 600, H3 // 2)
     r = rect(h)
-    print("after shrink: %dx%d  (expect 460 宽)" % (r.right - r.left, r.bottom - r.top))
+    print("after shrink: %dx%d  (expect 360 宽)" % (r.right - r.left, r.bottom - r.top))
 
     p = size_file()
     print("file:", open(p).read().strip() if os.path.exists(p) else "<none>")
