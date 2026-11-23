@@ -43,6 +43,7 @@
 // ================================================================== 常量
 static const wchar_t* MAIN_CLASS  = L"WinVClipMain";
 static const wchar_t* PANEL_CLASS = L"WinVClipPanelUI";
+static const wchar_t* GHOST_CLASS = L"WinVClipCaretGhost";
 
 // 主题色（对应 CSS 变量）
 static const COLORREF C_CANVAS   = RGB(244, 242, 237);   // --canvas  #F4F2ED
@@ -82,7 +83,7 @@ enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10 };
 enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
        TIMER_REPIN = 0x105, TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107,
-       TIMER_WARM = 0x108 };
+       TIMER_WARM = 0x108, TIMER_GHOST = 0x109 };
 
 // ================================================================== 数据
 
@@ -193,6 +194,16 @@ enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
 
 static bool g_caretOn = true;
 static int  g_gridScroll = 0;      // 表情/符号页的纵向滚动（像素）
+
+// 目标窗口的「影子光标」：面板抢焦点后真 caret 会被目标窗口自己隐藏，
+// 这里在 caret 原位画一根同尺寸的替身，让用户看着「光标还在」。
+static HWND     g_ghost = nullptr;
+static COLORREF g_ghostInk = RGB(24, 26, 30);
+static bool     g_ghostOn = false;
+static RECT     g_ghostRect{0, 0, 0, 0};
+// 目标窗口能否接收文本输入。必须在**抢焦点之前**算好并缓存：目标窗口一失焦就在
+// WM_KILLFOCUS 里 DestroyCaret，之后再查一定是「没有插入符」。
+static bool     g_targetTyping = false;
 
 static int g_dpi = 96;
 static HFONT g_fTitle = nullptr, g_fMeta = nullptr, g_fTab = nullptr, g_fChip = nullptr,
@@ -3264,6 +3275,8 @@ static void HidePanel();
 static void ShowPanel();
 static void PasteItem(int vi);
 static void ForceForeground(HWND hwnd);
+static bool AppAcceptsTyping(HWND wnd);
+static bool CaretRectOf(HWND wnd, RECT* out);
 
 static void Toast(const std::wstring& msg, bool info = false) {
     g_toast = msg;
@@ -3330,6 +3343,14 @@ static void PasteGlyph(int page, const GItem& it) {
 
     HWND target = g_target;
     if (target && IsWindow(target) && target != g_panel) {
+        if (!g_targetTyping && !AppAcceptsTyping(target)) {
+            // 资源管理器文件列表、桌面这类没有文本输入区的地方：字符注入进去插不进任何东西，
+            // 还会让 Shell 的键入查找响一声系统提示音，所以直接拒绝并说清原因。
+            // 判据优先用唤起面板时缓存的值——那时目标窗口还持有焦点，caret 是真的。
+            Toast(L"当前窗口不接受文本输入");
+            Redraw();
+            return;
+        }
         if (!g_pinned) HidePanel();      // 固定态保留面板，便于连续插入
         g_pasteTarget = target;
         g_keepOpen = g_pinned;
@@ -4215,6 +4236,135 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ================================================================== 目标窗口的文本插入符
+// 两个用途：
+//   1. 面板贴着「文本插入符」弹出，而不是跟着鼠标——用户唤起面板时光标往往并不在
+//      鼠标指针那儿；没有插入符可用时退回屏幕居中。
+//   2. 表情/符号直插之前判断目标窗口到底有没有文本输入区。资源管理器的文件列表、
+//      桌面这类地方没有插入符，把字符注入进去什么也插不进，还会触发系统提示音。
+static bool CaretRectOf(HWND wnd, RECT* out) {
+    if (!wnd || !IsWindow(wnd)) return false;
+    if (wnd == g_panel || wnd == g_main) return false;
+    DWORD tid = GetWindowThreadProcessId(wnd, nullptr);
+    if (!tid) return false;
+    GUITHREADINFO gi{}; gi.cbSize = sizeof(gi);
+    if (!GetGUIThreadInfo(tid, &gi)) return false;
+    if (!gi.hwndCaret || !IsWindow(gi.hwndCaret)) return false;
+
+    RECT rc = gi.rcCaret;
+    // rcCaret 的坐标基准在文档与实测之间不一致（一部分窗口给的是客户区坐标），
+    // 拿 caret 所在窗口的屏幕矩形做判别，否则面板会跑到屏幕外面去。
+    RECT wr{}; GetWindowRect(gi.hwndCaret, &wr);
+    POINT o{0, 0}; ClientToScreen(gi.hwndCaret, &o);
+    RECT conv{rc.left + o.x, rc.top + o.y, rc.right + o.x, rc.bottom + o.y};
+    auto inside = [](const RECT& r, const RECT& b) {
+        return r.left >= b.left - 2 && r.top >= b.top - 2 &&
+               r.right <= b.right + 2 && r.bottom <= b.bottom + 2;
+    };
+    if (inside(conv, wr)) *out = conv;
+    else if (inside(rc, wr)) *out = rc;
+    else return false;
+
+    if (out->right - out->left < 1) out->right = out->left + 1;
+    if (out->bottom - out->top < 1) out->bottom = out->top + S(16);   // 折叠成一点的 caret
+    return true;
+}
+
+// 有插入符就认为能接收文本输入。这个判据比猜窗口类名可靠得多：
+// 资源管理器文件列表没有 caret，它的地址栏有。
+static bool AppAcceptsTyping(HWND wnd) {
+    RECT rc{};
+    return CaretRectOf(wnd, &rc);
+}
+
+// ================================================================== 影子光标
+// 面板一抢焦点，目标窗口必然收到 WM_KILLFOCUS 并 HideCaret，记事本里的光标就没了。
+// 真 caret 属于拥有焦点的线程，外部没法让它在别的线程里继续闪（ShowCaret 是每队列
+// 资源，且目标窗口自己会在失焦时反复隐藏），所以在 caret 原位画一根同尺寸的替身：
+// 普通顶层窗口、click-through、不抢焦点，z 序压在面板之下。
+static LRESULT CALLBACK GhostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH b = CreateSolidBrush(g_ghostInk);
+        FillRect(dc, &rc, b);
+        DeleteObject(b);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// caret 底下原本是文字，靠反色保证深色主题下也看得见
+static COLORREF CaretInkColor(const RECT& r) {
+    HDC dc = GetDC(nullptr);
+    long sum = 0; int n = 0;
+    for (int y = r.top; y < r.bottom; y += 2) {
+        for (int x = r.left - 2; x <= r.right + 2; x += 2) {
+            COLORREF c = GetPixel(dc, x, y);
+            if (c == CLR_INVALID) continue;
+            sum += (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+            ++n;
+        }
+    }
+    ReleaseDC(nullptr, dc);
+    return (n && sum / n > 128) ? RGB(24, 26, 30) : RGB(245, 245, 245);
+}
+
+static void GhostHide() {
+    g_ghostOn = false;
+    g_ghostRect = RECT{0, 0, 0, 0};
+    if (g_ghost && IsWindowVisible(g_ghost)) ShowWindow(g_ghost, SW_HIDE);
+}
+
+static void GhostShowAt(const RECT& r, COLORREF ink) {
+    if (!g_ghost) return;
+    int w = r.right - r.left; if (w < 2) w = 2;
+    int h = r.bottom - r.top; if (h < 2) h = 2;
+    g_ghostInk = ink;
+    g_ghostRect = r;
+    g_ghostOn = true;
+    SetWindowPos(g_ghost, HWND_TOP, r.left, r.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // 压在面板之下：面板盖住 caret 时不能有东西浮在面板上面
+    if (g_panel) {
+        SetWindowPos(g_ghost, g_panel, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    SetLayeredWindowAttributes(g_ghost, 0, 255, LWA_ALPHA);
+    InvalidateRect(g_ghost, nullptr, FALSE);
+}
+
+// 每 530ms 一拍：能读到 caret 就跟着目标窗口的重绘/滚动挪位置，读不到就沿用最后
+// 一次已知位置。后者是常态——目标窗口一失焦就在 WM_KILLFOCUS 里 DestroyCaret 了
+// （实测记事本的 hwndCaret 直接变 0），跟着隐藏的话影子根本不会出现。
+static void GhostTick() {
+    if (!g_ghost || !g_panel || !g_target || !IsWindowVisible(g_panel)) { GhostHide(); return; }
+    // 目标窗口自己拿回前台时真 caret 会回来，影子要让位
+    if (GetForegroundWindow() == g_target) { GhostHide(); return; }
+
+    RECT cr{};
+    if (CaretRectOf(g_target, &cr) &&
+        (cr.left != g_ghostRect.left || cr.top != g_ghostRect.top ||
+         cr.right != g_ghostRect.right || cr.bottom != g_ghostRect.bottom)) {
+        g_ghostRect = cr;
+        int w = cr.right - cr.left; if (w < 2) w = 2;
+        int h = cr.bottom - cr.top; if (h < 2) h = 2;
+        SetWindowPos(g_ghost, nullptr, cr.left, cr.top, w, h,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    if (g_ghostRect.right <= g_ghostRect.left || g_ghostRect.bottom <= g_ghostRect.top) {
+        GhostHide();
+        return;
+    }
+    if (!IsWindowVisible(g_ghost)) ShowWindow(g_ghost, SW_SHOWNA);
+    g_ghostOn = !g_ghostOn;
+    SetLayeredWindowAttributes(g_ghost, 0, g_ghostOn ? 255 : 0, LWA_ALPHA);
+}
+
 // ================================================================== 显示 / 隐藏
 static void RoundCorners(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
@@ -4229,6 +4379,8 @@ static void HidePanel() {
         KillTimer(g_panel, TIMER_CARET);
         KillTimer(g_panel, TIMER_FOCUS);
         KillTimer(g_panel, TIMER_EMOJI);
+        KillTimer(g_main, TIMER_GHOST);
+        GhostHide();             // 影子光标跟着面板一起收，别在桌面上留一根线
         ShowWindow(g_panel, SW_HIDE);
         g_query.clear(); g_comp.clear();
         g_menuOpen = false;
@@ -4288,9 +4440,22 @@ static void ShowPanel() {
     HWND fg = GetForegroundWindow();
     if (fg && fg != g_panel) g_target = fg;
 
-    // 位置：跟随光标弹出（默认右下，越界翻向左上，最后夹紧到工作区）
+    // 位置：优先贴着目标窗口的文本插入符弹出；拿不到插入符（桌面、文件列表等
+    // 没有文本输入区的地方）就居中于鼠标所在显示器。
     POINT pt; GetCursorPos(&pt);
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+
+    RECT caretRect{};
+    bool hasCaret = false;
+    COLORREF ink = RGB(24, 26, 30);
+    if (g_target && CaretRectOf(g_target, &caretRect)) {
+        hasCaret = true;
+        POINT c{caretRect.left, caretRect.top};
+        mon = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);   // 光标可能跨屏
+        ink = CaretInkColor(caretRect);   // 必须在抢焦点之前采样：之后这块可能被面板盖住
+    }
+    g_targetTyping = hasCaret;            // 点击插入时的判据，见 PasteGlyph
+
     MONITORINFO mi{}; mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
     int workW = mi.rcWork.right - mi.rcWork.left;
@@ -4309,11 +4474,17 @@ static void ShowPanel() {
     BuildView();
     ComputeLayout();
 
-    int off = S(10);
-    int x = pt.x + off;
-    int y = pt.y + off;
-    if (x + w > mi.rcWork.right - S(8)) x = pt.x - off - w;      // 右侧放不下 → 翻到光标左侧
-    if (y + h > mi.rcWork.bottom - S(8)) y = pt.y - off - h;      // 下方放不下 → 翻到光标上方
+    int x = 0, y = 0;
+    if (hasCaret) {
+        // 左缘大致对齐插入符，落在插入符下方；下方放不下就翻到上方
+        x = caretRect.left - S(2);
+        y = caretRect.bottom + S(8);
+        if (y + h > mi.rcWork.bottom - S(8)) y = caretRect.top - S(8) - h;
+        if (x + w > mi.rcWork.right - S(8)) x = caretRect.right - w;
+    } else {
+        x = mi.rcWork.left + (w < workW ? (workW - w) / 2 : 0);
+        y = mi.rcWork.top + (h < workH ? (workH - h) / 2 : 0);
+    }
 
     int minX = mi.rcWork.left + S(8), minY = mi.rcWork.top + S(8);
     int maxX = mi.rcWork.right - S(8) - w, maxY = mi.rcWork.bottom - S(8) - h;
@@ -4326,6 +4497,13 @@ static void ShowPanel() {
     RoundCorners(g_panel);
     g_shownAt = GetTickCount();
     ForceForeground(g_panel);
+    // 抢焦点会立刻让目标窗口隐藏插入符，所以影子要在抢完之后画
+    if (hasCaret) {
+        GhostShowAt(caretRect, ink);
+        SetTimer(g_main, TIMER_GHOST, 530, nullptr);
+    } else {
+        GhostHide();
+    }
     SetTimer(g_panel, TIMER_CARET, 530, nullptr);
     SetTimer(g_panel, TIMER_FOCUS, 150, nullptr);
     Redraw();
@@ -4416,10 +4594,24 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_panel && IsWindowVisible(g_panel)) Redraw();
         } else if (wp == TIMER_PASTE) {
             KillTimer(hwnd, TIMER_PASTE);
-            if (g_pasteTarget && IsWindow(g_pasteTarget)) {
-                SetForegroundWindow(g_pasteTarget);
-                if (!g_typePending.empty()) {
-                    TypeUnicode(g_typePending);      // 表情/符号：直插，不动剪贴板
+            HWND target = g_pasteTarget;
+            g_pasteTarget = nullptr;
+            std::wstring pending = g_typePending;
+            g_typePending.clear();
+            if (target && IsWindow(target)) {
+                // 这里必须真把前台抢回来再发按键。以前用 SetForegroundWindow 猜一下，
+                // 抢不到（前台锁）时按键会落到我们自己的面板上：面板没有文本区，
+                // DefWindowProc 对没人处理的 WM_CHAR 会响系统提示音，目标窗口则什么都没收到，
+                // 看起来就是「插入无效 + 叮一声 + 目标窗口失焦」。
+                ForceForeground(target);
+                if (GetForegroundWindow() != target) {
+                    Toast(L"目标窗口没有获得焦点，已取消");
+                    if (g_keepOpen) { g_keepOpen = false; ForceForeground(g_panel); }
+                    Redraw();
+                    return 0;
+                }
+                if (!pending.empty()) {
+                    TypeUnicode(pending);            // 表情/符号：直插，不动剪贴板
                 } else {
                     INPUT in[4]{};
                     in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_CONTROL;
@@ -4429,16 +4621,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SendInput(4, in, sizeof(INPUT));
                 }
             }
-            g_typePending.clear();
-            g_pasteTarget = nullptr;
             if (g_keepOpen) {
                 g_keepOpen = false;
                 SetTimer(g_main, TIMER_REPIN, 70, nullptr);
             }
+        } else if (wp == TIMER_GHOST) {
+            GhostTick();
         } else if (wp == TIMER_REPIN) {
             KillTimer(hwnd, TIMER_REPIN);
-            // 固定态粘贴完成后把前台收回面板，接着点下一个
-            if (g_pinned && g_panel && IsWindowVisible(g_panel)) ForceForeground(g_panel);
+            // 固定态粘贴完成后把前台收回面板，接着点下一个。
+            // 收回之前先量一遍 caret：插入了字符，位置已经变了；而面板一抢到前台，
+            // 目标窗口就会销毁 caret，之后再也读不到。
+            if (g_pinned && g_panel && IsWindowVisible(g_panel)) {
+                RECT cr{}; bool have = g_target && CaretRectOf(g_target, &cr);
+                COLORREF ink = have ? CaretInkColor(cr) : g_ghostInk;
+                ForceForeground(g_panel);
+                if (have) GhostShowAt(cr, ink); else GhostHide();
+            }
         }
         return 0;
 
@@ -4519,6 +4718,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     wc.style = CS_DROPSHADOW;
     RegisterClassExW(&wc);
 
+    wc.lpfnWndProc = GhostProc;
+    wc.lpszClassName = GHOST_CLASS;
+    wc.style = 0;
+    RegisterClassExW(&wc);
+
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, MAIN_CLASS, L"WinVClip", WS_POPUP, 0, 0, 0, 0,
                              nullptr, nullptr, hInst, nullptr);
     if (!g_main) return 1;
@@ -4526,6 +4730,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     g_panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, PANEL_CLASS, L"", WS_POPUP,
                               0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
     if (!g_panel) return 1;
+
+    // 影子光标：非 topmost（永远在面板之下）、click-through、不抢焦点、分层以便闪烁
+    g_ghost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
+                              WS_EX_LAYERED, GHOST_CLASS, L"", WS_POPUP,
+                              0, 0, 2, 16, nullptr, nullptr, hInst, nullptr);
 
     AddClipboardFormatListener(g_main);
 
