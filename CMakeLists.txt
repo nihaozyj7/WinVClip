@@ -24,6 +24,10 @@ set(WINVCLIP_SOURCES
     src/core/io_png.cpp
     src/core/text_measure.cpp
     src/core/text_util.cpp
+    src/core/util.cpp
+    src/render/dc.cpp
+    src/render/icons.cpp
+    src/render/fonts.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
 )
