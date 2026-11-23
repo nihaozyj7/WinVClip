@@ -19,6 +19,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(WINVCLIP_SOURCES
     src/app/main.cpp
+    src/app/hook.cpp
+    src/app/tray.cpp
     src/core/app_state.cpp
     src/core/diag.cpp
     src/core/io_png.cpp

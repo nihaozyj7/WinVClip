@@ -26,6 +26,3 @@ void PanelKeyDown(int vk, bool ctrl);
 // 字符输入（IME 上屏 / 直接输入的可见字符）
 void PanelChar(wchar_t c);
 
-// 这个裸键面板会不会消费。钩子是串行链，吞得越宽，别家的全局热键越哑，
-// 所以只接管真正要用的键（见实现里的白名单）。
-bool PanelConsumesBareKey(DWORD vk, wchar_t ch);
