@@ -104,6 +104,12 @@ def focus_of(hwnd):
     return g.hwndFocus
 
 
+def cls(h):
+    b = ctypes.create_unicode_buffer(256)
+    u.GetClassNameW(h, b, 256)
+    return b.value
+
+
 def main():
     exp = u.FindWindowW("CabinetWClass", None)
     if not exp:
@@ -125,13 +131,23 @@ def main():
 
     ok_all = True
     for rnd in range(1, 4):
-        u.SetForegroundWindow(exp); time.sleep(0.4)
-        combo(0x11, 0x4C)    # Ctrl+L：聚焦地址栏
-        time.sleep(0.4)
+        # 置前 + Ctrl+L 聚焦地址栏，两者都可能静默失败（前台锁 / 窗口刚就绪），
+        # 失败就要重试——否则键盘输入会落在这个窗口的其他部位，
+        # 读回的「地址栏内容」其实是整窗文本，看起来像功能坏了。
+        for attempt in range(8):
+            u.SetForegroundWindow(exp)
+            time.sleep(0.3)
+            if u.GetForegroundWindow() != exp:
+                continue
+            combo(0x11, 0x4C)
+            time.sleep(0.35)
+            if cls(focus_of(exp) or 0) in ("Edit", "RichEditD2DPT", "DirectUIHWND",
+                                           "InputSiteWindowClass"):
+                break
         f0 = focus_of(exp)
         uni('Z'); uni('Z'); uni('Z')
         time.sleep(0.3)
-        print("round %d: 地址栏 focus=0x%X, 输入 ZZZ" % (rnd, f0 or 0))
+        print("round %d: 地址栏 focus=0x%X (%s), 输入 ZZZ" % (rnd, f0 or 0, cls(f0 or 0)))
 
         winv()
         time.sleep(0.8)

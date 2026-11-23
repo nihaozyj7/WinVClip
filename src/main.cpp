@@ -44,7 +44,7 @@
 // ================================================================== 常量
 static const wchar_t* MAIN_CLASS  = L"WinVClipMain";
 static const wchar_t* PANEL_CLASS = L"WinVClipPanelUI";
-static const wchar_t* GHOST_CLASS = L"WinVClipCaretGhost";
+
 
 // 主题色（对应 CSS 变量）
 static const COLORREF C_CANVAS   = RGB(244, 242, 237);   // --canvas  #F4F2ED
@@ -83,8 +83,7 @@ enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
 
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10 };
 enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
-       TIMER_REPIN = 0x105, TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107,
-       TIMER_WARM = 0x108, TIMER_GHOST = 0x109 };
+       TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108 };
 
 // ================================================================== 数据
 
@@ -150,11 +149,27 @@ static HWND   g_pasteTarget = nullptr;
 static HWND   g_targetFocus = nullptr;
 
 static bool   g_lwin = false, g_rwin = false;
+// 修饰键状态必须自己跟踪：钩子吞掉按键后系统不会更新全局键盘状态，
+// GetAsyncKeyState / GetKeyState 在回调里都会读到「没按下」，Ctrl+1 因此会被
+// 误当成字符 '1' 打进搜索框（早期实测踩过）。
+static bool   g_ctrlDown = false, g_shiftDown = false;
 static bool   g_swallowVUp = false;
 static bool   g_vDown = false;       // V 当前是否处于按下（用来识别长按产生的自动重复键）
 static DWORD  g_vDownAt = 0;
-static DWORD  g_shownAt = 0;
-static int    g_rescueTries = 0;     // 唤起瞬间允许重新抢回前台的次数，见 FocusStillOurs
+
+// 自己注入的按键统一打上这个标记。钩子靠它区分「本程序注入」和「其他来源的注入」：
+// 前者必须放行（否则固定态连着插表情时，自己注入的字符会被自己的钩子吞掉），
+// 后者照常转发给面板，跟真人按键一视同仁——自动化测试也正是靠这一点才能驱动面板。
+static const ULONG_PTR g_injectMark = 0x57494E56;   // 'WINV'
+static void MarkMine(INPUT& in) { in.ki.dwExtraInfo = g_injectMark; }
+
+// 面板的两种活法（关键设计，见文件末尾「焦点模型」一节）：
+//   false = 非激活态（默认）。面板带 WS_EX_NOACTIVATE，从不夺取前台，目标窗口的
+//           键盘焦点和文本插入符一直保留着；面板要用的按键由低级键盘钩子转发进来。
+//           这正是系统 Win+V 面板的做法——光标不消失的根本原因是「从来没抢过焦点」。
+//   true  = 输入态。用户点了搜索框才把前台交给面板，用于输入法（中文）组合——
+//           IME 必须有真正的键盘焦点才工作。此时光标消失是用户主动进入搜索态的代价，
+//           按 Esc 结束搜索就还回去。
 
 static std::deque<ClipItem> g_items;
 
@@ -187,7 +202,6 @@ static bool g_modalOpen = false;
 static int  g_modalRow = -1;
 
 static bool g_pinned = false;        // 临时固定：本次显示期间不失焦隐藏 + 置顶，关闭后自动取消
-static bool g_keepOpen = false;      // 固定态粘贴后需要把前台收回面板
 static std::wstring g_typePending;   // 待注入的文本（表情/符号直插，不经剪贴板）
 
 // 面板尺寸：g_panelW/H 是本次显示的实际值，g_savedW/H 是上次调整后落盘的值
@@ -202,15 +216,13 @@ enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
 static bool g_caretOn = true;
 static int  g_gridScroll = 0;      // 表情/符号页的纵向滚动（像素）
 
-// 目标窗口的「影子光标」：面板抢焦点后真 caret 会被目标窗口自己隐藏，
-// 这里在 caret 原位画一根同尺寸的替身，让用户看着「光标还在」。
-static HWND     g_ghost = nullptr;
-static COLORREF g_ghostInk = RGB(24, 26, 30);
-static bool     g_ghostOn = false;
-static RECT     g_ghostRect{0, 0, 0, 0};
-// 目标窗口能否接收文本输入。必须在**抢焦点之前**算好并缓存：目标窗口一失焦就在
-// WM_KILLFOCUS 里 DestroyCaret，之后再查一定是「没有插入符」。
+// 目标窗口能否接收文本输入。非激活态下目标窗口一直持有焦点，随时可查；
+// 仍然缓存一份，供「唤起时刻」与固定态切换目标时判断。
 static bool     g_targetTyping = false;
+// 面板是否处于「输入态」：见文件开头焦点模型的说明
+static bool     g_inputMode = false;
+// 钩子转发给面板的按键消息（wParam=vk，lParam=MAKELPARAM(ctrl, ch)）
+enum { WM_APP_PANELKEY = WM_APP + 3 };
 
 static int g_dpi = 96;
 static HFONT g_fTitle = nullptr, g_fMeta = nullptr, g_fTab = nullptr, g_fChip = nullptr,
@@ -2132,6 +2144,7 @@ static void TypeUnicode(const std::wstring& s) {
         a.ki.wVk = 0;
         a.ki.wScan = (WORD)c;
         a.ki.dwFlags = KEYEVENTF_UNICODE;
+        MarkMine(a);
         in.push_back(a);
         a.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         in.push_back(a);
@@ -3298,7 +3311,7 @@ static void Trace(const char* fmt, ...) {
 }
 
 static void HidePanel();
-static bool FocusStillOurs(HWND hwnd);
+static bool PanelShouldStay(HWND hwnd);
 static void RestoreTargetFocus(HWND target, HWND focus);
 static void ShowPanel();
 static void PasteItem(int vi);
@@ -3328,9 +3341,10 @@ static void ToggleTemporaryPin() {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         Toast(L"已临时固定，可连续插入", true);
     } else {
-        // 取消固定后要立刻回到「失焦即隐藏」：若当前已经不在前台，就不会再有
-        // WA_INACTIVE 送过来，只能在这里主动收起，否则面板会一直挂在最上层
-        if (GetForegroundWindow() != g_panel) { HidePanel(); return; }
+        // 取消固定后立刻回到「前台不在目标窗口就收起」的规则。
+        // 注意判据变了：非激活态下面板从不持有前台，所以不能再看「前台是不是面板」，
+        // 要看「前台还是不是唤起时那个目标窗口」。
+        if (!PanelShouldStay(g_panel)) { HidePanel(); return; }
         Toast(L"已取消临时固定", true);
     }
     Redraw();
@@ -3356,8 +3370,8 @@ static void PasteItem(int vi) {
     PutToClipboard(it);
     if (target && IsWindow(target) && target != g_panel) {
         g_pasteTarget = target;
-        g_keepOpen = g_pinned;       // 粘完把前台收回面板
-        SetForegroundWindow(target);
+        // 非激活态下前台本来就是目标窗口，这行是空转；只有输入态才需要交还。
+        if (GetForegroundWindow() != target) SetForegroundWindow(target);
         SetTimer(g_main, TIMER_PASTE, 90, nullptr);
     }
 }
@@ -3381,9 +3395,8 @@ static void PasteGlyph(int page, const GItem& it) {
         }
         if (!g_pinned) HidePanel();      // 固定态保留面板，便于连续插入
         g_pasteTarget = target;
-        g_keepOpen = g_pinned;
         g_typePending = U8N(it.g, it.gl);
-        SetForegroundWindow(target);
+        if (GetForegroundWindow() != target) SetForegroundWindow(target);
         SetTimer(g_main, TIMER_PASTE, 90, nullptr);
     } else {
         // 没有可插入的目标窗口（比如在桌面上唤起面板）：退回复制，至少不会「点了没反应」
@@ -3736,6 +3749,113 @@ static void WheelBody(int delta) {
 }
 
 // ================================================================== 窗口过程
+// 面板的按键处理。两个入口共用这一份逻辑：
+//   · 输入态（用户点过搜索框，面板持有焦点）→ 系统投递的 WM_KEYDOWN；
+//   · 非激活态（常态）→ 低级键盘钩子转发来的 WM_APP_PANELKEY。
+static void PanelKeyDown(int vk, bool ctrl) {
+
+        // 输入法正在组合（g_comp 非空）：按键是给输入法的（空格上屏、Esc 取消、
+        // 数字选候选），别让它们顺带触发面板的快捷键——尤其 Esc，否则想取消
+        // 组合反而把面板关了。
+        if (!g_comp.empty()) return;
+
+        if (g_modalOpen) {
+            if (vk == VK_ESCAPE) { g_modalOpen = false; Redraw(); return; }
+            if (vk == VK_RETURN) {
+                if (g_modalRow >= 0 && g_modalRow < L.nRow && g_top + g_modalRow < (int)g_view.size()) {
+                    g_items.erase(g_items.begin() + g_view[g_top + g_modalRow]);
+                    g_sel = 0; g_top = 0;
+                }
+                g_modalOpen = false;
+                BuildView(); ComputeLayout();
+                Toast(L"已删除", true);
+                Redraw();
+                return;
+            }
+            return;
+        }
+        if (g_menuOpen) {
+            if (vk == VK_ESCAPE) { g_menuOpen = false; Redraw(); return; }
+            if (vk == VK_DOWN || vk == VK_UP) {
+                int d = (vk == VK_DOWN) ? 1 : MI_COUNT - 1;
+                g_menuHover = (g_menuHover < 0) ? 0 : (g_menuHover + d) % MI_COUNT;
+                Redraw();
+                return;
+            }
+            if (vk == VK_RETURN) {
+                RunMenuItem(g_menuHover < 0 ? 0 : g_menuHover);
+                return;
+            }
+        }
+
+        if (ctrl) {
+            if (vk >= '1' && vk <= '4') { SetPage(vk - '1'); return; }
+            if (vk == 'P') { TogglePinItem(SelItem()); return; }
+            if (vk == 'D') { ToggleFav(SelView()); return; }
+            if (vk == 'S') { SaveItemAs(SelItem()); return; }
+            return;
+        }
+
+        switch (vk) {
+        case VK_ESCAPE:
+            if (g_drawerOpen) { ToggleDrawer(false); return; }
+            HidePanel();
+            return;
+        case VK_RETURN:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) PasteItem(SelView());
+            return;
+        case VK_UP:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) {
+                if (g_sel > 0) { --g_sel; ClampScroll(); Redraw(); }
+            }
+            return;
+        case VK_DOWN:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) {
+                if (g_sel + 1 < (int)g_view.size()) { ++g_sel; ClampScroll(); Redraw(); }
+            }
+            return;
+        case VK_PRIOR:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) {
+                g_sel = (std::max)(0, g_sel - L.nRow);
+                ClampScroll(); Redraw();
+            }
+            return;
+        case VK_NEXT:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) {
+                g_sel = (std::min)((int)g_view.size() - 1, g_sel + L.nRow);
+                ClampScroll(); Redraw();
+            }
+            return;
+        case VK_BACK:
+            if (!g_query.empty()) {
+                g_query.pop_back();
+                g_sel = 0; g_top = 0;
+                BuildView(); ComputeLayout(); Redraw();
+            }
+            return;
+        case VK_DELETE:
+            if (g_page == PG_HISTORY || g_page == PG_FAV) {
+                g_modalOpen = true;
+                g_modalRow = g_sel - g_top;
+                Redraw();
+            }
+            return;
+        case VK_TAB:
+            SetPage((g_page + 1) % PG_COUNT);
+            return;
+        }
+}
+
+// 字符输入：同样两个入口（WM_CHAR / 钩子转发的字符）
+static void PanelChar(wchar_t c) {
+    if (c >= 32 && c != 127) {
+        g_query.push_back(c);
+        g_sel = 0; g_top = 0;
+        BuildView(); ComputeLayout();
+        Redraw();
+    }
+}
+
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND:
@@ -3766,124 +3886,34 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_page == PG_EMOJI) Redraw(&L.body);
             if (more) SetTimer(hwnd, TIMER_EMOJI, 8, nullptr);
         } else if (wp == TIMER_FOCUS) {
-            // 轮询前台窗口：WM_ACTIVATE 在「面板是靠 AttachThreadInput 抢来的前台」时
-            // 并不保证送达（实测有时收不到 WA_INACTIVE），只靠事件会让面板卡在屏幕上。
+            // 轮询前台窗口。非激活态下面板收不到 WA_INACTIVE（它本来就没被激活过），
+            // 所以「用户有没有切走」只能靠轮询看前台是谁，见 PanelShouldStay。
             if (!g_pinned && !g_dragging && !g_dialogOpen) {
-                if (!FocusStillOurs(hwnd)) {
+                if (!PanelShouldStay(hwnd)) {
                     g_menuOpen = false;
                     g_modalOpen = false;
                     HidePanel();
+                } else if (g_inputMode && GetForegroundWindow() != hwnd) {
+                    // 用户从输入态点回了目标窗口：退出输入态，回到钩子转发模式
+                    g_inputMode = false;
                 }
             }
         }
         return 0;
 
-    case WM_KEYDOWN: {
-        int vk = (int)wp;
-        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-
-        // 输入法正在组合（g_comp 非空）：按键是给输入法的（空格上屏、Esc 取消、
-        // 数字选候选），别让它们顺带触发面板的快捷键——尤其 Esc，否则想取消
-        // 组合反而把面板关了。
-        if (!g_comp.empty()) return 0;
-
-        if (g_modalOpen) {
-            if (vk == VK_ESCAPE) { g_modalOpen = false; Redraw(); return 0; }
-            if (vk == VK_RETURN) {
-                if (g_modalRow >= 0 && g_modalRow < L.nRow && g_top + g_modalRow < (int)g_view.size()) {
-                    g_items.erase(g_items.begin() + g_view[g_top + g_modalRow]);
-                    g_sel = 0; g_top = 0;
-                }
-                g_modalOpen = false;
-                BuildView(); ComputeLayout();
-                Toast(L"已删除", true);
-                Redraw();
-                return 0;
-            }
-            return 0;
-        }
-        if (g_menuOpen) {
-            if (vk == VK_ESCAPE) { g_menuOpen = false; Redraw(); return 0; }
-            if (vk == VK_DOWN || vk == VK_UP) {
-                int d = (vk == VK_DOWN) ? 1 : MI_COUNT - 1;
-                g_menuHover = (g_menuHover < 0) ? 0 : (g_menuHover + d) % MI_COUNT;
-                Redraw();
-                return 0;
-            }
-            if (vk == VK_RETURN) {
-                RunMenuItem(g_menuHover < 0 ? 0 : g_menuHover);
-                return 0;
-            }
-        }
-
-        if (ctrl) {
-            if (vk >= '1' && vk <= '4') { SetPage(vk - '1'); return 0; }
-            if (vk == 'P') { TogglePinItem(SelItem()); return 0; }
-            if (vk == 'D') { ToggleFav(SelView()); return 0; }
-            if (vk == 'S') { SaveItemAs(SelItem()); return 0; }
-            return 0;
-        }
-
-        switch (vk) {
-        case VK_ESCAPE:
-            if (g_drawerOpen) { ToggleDrawer(false); return 0; }
-            HidePanel();
-            return 0;
-        case VK_RETURN:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) PasteItem(SelView());
-            return 0;
-        case VK_UP:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                if (g_sel > 0) { --g_sel; ClampScroll(); Redraw(); }
-            }
-            return 0;
-        case VK_DOWN:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                if (g_sel + 1 < (int)g_view.size()) { ++g_sel; ClampScroll(); Redraw(); }
-            }
-            return 0;
-        case VK_PRIOR:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                g_sel = (std::max)(0, g_sel - L.nRow);
-                ClampScroll(); Redraw();
-            }
-            return 0;
-        case VK_NEXT:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                g_sel = (std::min)((int)g_view.size() - 1, g_sel + L.nRow);
-                ClampScroll(); Redraw();
-            }
-            return 0;
-        case VK_BACK:
-            if (!g_query.empty()) {
-                g_query.pop_back();
-                g_sel = 0; g_top = 0;
-                BuildView(); ComputeLayout(); Redraw();
-            }
-            return 0;
-        case VK_DELETE:
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                g_modalOpen = true;
-                g_modalRow = g_sel - g_top;
-                Redraw();
-            }
-            return 0;
-        case VK_TAB:
-            SetPage((g_page + 1) % PG_COUNT);
-            return 0;
-        }
+    case WM_KEYDOWN:
+        PanelKeyDown((int)wp, (GetKeyState(VK_CONTROL) & 0x8000) != 0);
         return 0;
-    }
+
+    // 非激活态下按键由钩子转发到这里（面板没有键盘焦点，见 LLKeyboard）
+    case WM_APP_PANELKEY:
+        PanelKeyDown((int)wp, LOWORD(lp) != 0);
+        if (HIWORD(lp)) PanelChar((wchar_t)HIWORD(lp));
+        return 0;
 
     case WM_CHAR:
-        if (wp >= 32 && wp != 127) {
-            g_query.push_back((wchar_t)wp);
-            g_sel = 0; g_top = 0;
-            BuildView(); ComputeLayout();
-            Redraw();
-        }
+        PanelChar((wchar_t)wp);
         return 0;
-
     // ---------------------------------------------------------- 输入法
     // 搜索框是自绘的，系统不知道光标在哪：组合串自己收、自己画，
     // 并把候选窗钉到光标下方。不处理这些消息的话，中文一个字也打不进来。
@@ -4094,6 +4124,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        // 点搜索框 → 进入输入态。中文搜索要靠输入法，而输入法组合必须有真正的
+        // 键盘焦点，只能把前台交给面板。这是唯一会让目标窗口光标暂时消失的入口，
+        // 由用户主动点击触发；Esc 关掉面板即刻还原。
+        // IsWindowVisible 兜住「面板已隐藏却仍收到投递消息」的情况，否则前台会停在
+        // 一个不可见的窗口上，而隐藏之后定时器也停了，没人再把它收回来。
+        if (IsWindowVisible(hwnd) && PtIn(L.searchBox, pt) && GetForegroundWindow() != hwnd) {
+            g_inputMode = true;
+            ForceForeground(hwnd);
+            return 0;
+        }
+
         // 分类抽屉：点条目选中分类、点关闭或点抽屉外收起
         if (g_drawerOpen && PtIn(L.drawer, pt)) {
             if (PtIn(L.drawerClose, pt)) { ToggleDrawer(false); return 0; }
@@ -4231,6 +4272,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    // 面板是 WS_EX_NOACTIVATE，正常不会收到这些消息；只有「输入态」（用户点过
+    // 搜索框，我们主动把前台交给面板）以及文件对话框关闭后才会走到这里。
+    case WM_MOUSEACTIVATE:
+        // 鼠标点面板不要激活它：焦点留在目标窗口，光标继续闪。
+        return MA_NOACTIVATE;
+
     case WM_ACTIVATE:
         Trace("WM_ACTIVATE wp=%d fg=%p", (int)LOWORD(wp), (void*)GetForegroundWindow());
         if (LOWORD(wp) == WA_INACTIVE) {
@@ -4241,10 +4288,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (fg && fg != hwnd) g_target = fg;
                 return 0;
             }
-            // 失焦即收起，但不要当场收：抢前台的刹那 explorer 常常先夺回一次前台，
-            // 同步 HidePanel 会把这一次抖动当成唯一的失焦事件，用户看到的就是
-            // 「按了 Win+V，原窗口失焦、面板没出来，得再按一次」。投递到队列排空后复查，
-            // 抖动会自愈；真丢了焦点就照旧收起（见 FocusStillOurs）。
+            // 输入态下失去前台：可能是用户点回了目标窗口（正常，继续留着），
+            // 也可能是点去了别的窗口。统一交给 PanelShouldStay 判断，别在这里下结论。
             PostMessageW(hwnd, WM_APP_DEFER_HIDE, 0, 0);
             return 0;
         }
@@ -4253,7 +4298,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_DEFER_HIDE:
         Trace("WM_APP_DEFER_HIDE fg=%p", (void*)GetForegroundWindow());
         if (g_pinned || g_dialogOpen || g_dragging) return 0;
-        if (!FocusStillOurs(hwnd)) {
+        if (!PanelShouldStay(hwnd)) {
             g_menuOpen = false;
             g_modalOpen = false;
             HidePanel();
@@ -4304,94 +4349,6 @@ static bool AppAcceptsTyping(HWND wnd) {
     return CaretRectOf(wnd, &rc);
 }
 
-// ================================================================== 影子光标
-// 面板一抢焦点，目标窗口必然收到 WM_KILLFOCUS 并 HideCaret，记事本里的光标就没了。
-// 真 caret 属于拥有焦点的线程，外部没法让它在别的线程里继续闪（ShowCaret 是每队列
-// 资源，且目标窗口自己会在失焦时反复隐藏），所以在 caret 原位画一根同尺寸的替身：
-// 普通顶层窗口、click-through、不抢焦点，z 序压在面板之下。
-static LRESULT CALLBACK GhostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc; GetClientRect(hwnd, &rc);
-        HBRUSH b = CreateSolidBrush(g_ghostInk);
-        FillRect(dc, &rc, b);
-        DeleteObject(b);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-// caret 底下原本是文字，靠反色保证深色主题下也看得见
-static COLORREF CaretInkColor(const RECT& r) {
-    HDC dc = GetDC(nullptr);
-    long sum = 0; int n = 0;
-    for (int y = r.top; y < r.bottom; y += 2) {
-        for (int x = r.left - 2; x <= r.right + 2; x += 2) {
-            COLORREF c = GetPixel(dc, x, y);
-            if (c == CLR_INVALID) continue;
-            sum += (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
-            ++n;
-        }
-    }
-    ReleaseDC(nullptr, dc);
-    return (n && sum / n > 128) ? RGB(24, 26, 30) : RGB(245, 245, 245);
-}
-
-static void GhostHide() {
-    g_ghostOn = false;
-    g_ghostRect = RECT{0, 0, 0, 0};
-    if (g_ghost && IsWindowVisible(g_ghost)) ShowWindow(g_ghost, SW_HIDE);
-}
-
-static void GhostShowAt(const RECT& r, COLORREF ink) {
-    if (!g_ghost) return;
-    int w = r.right - r.left; if (w < 2) w = 2;
-    int h = r.bottom - r.top; if (h < 2) h = 2;
-    g_ghostInk = ink;
-    g_ghostRect = r;
-    g_ghostOn = true;
-    SetWindowPos(g_ghost, HWND_TOP, r.left, r.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    // 压在面板之下：面板盖住 caret 时不能有东西浮在面板上面
-    if (g_panel) {
-        SetWindowPos(g_ghost, g_panel, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
-    SetLayeredWindowAttributes(g_ghost, 0, 255, LWA_ALPHA);
-    InvalidateRect(g_ghost, nullptr, FALSE);
-}
-
-// 每 530ms 一拍：能读到 caret 就跟着目标窗口的重绘/滚动挪位置，读不到就沿用最后
-// 一次已知位置。后者是常态——目标窗口一失焦就在 WM_KILLFOCUS 里 DestroyCaret 了
-// （实测记事本的 hwndCaret 直接变 0），跟着隐藏的话影子根本不会出现。
-static void GhostTick() {
-    if (!g_ghost || !g_panel || !g_target || !IsWindowVisible(g_panel)) { GhostHide(); return; }
-    // 目标窗口自己拿回前台时真 caret 会回来，影子要让位
-    if (GetForegroundWindow() == g_target) { GhostHide(); return; }
-
-    RECT cr{};
-    if (CaretRectOf(g_target, &cr) &&
-        (cr.left != g_ghostRect.left || cr.top != g_ghostRect.top ||
-         cr.right != g_ghostRect.right || cr.bottom != g_ghostRect.bottom)) {
-        g_ghostRect = cr;
-        int w = cr.right - cr.left; if (w < 2) w = 2;
-        int h = cr.bottom - cr.top; if (h < 2) h = 2;
-        SetWindowPos(g_ghost, nullptr, cr.left, cr.top, w, h,
-                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
-    if (g_ghostRect.right <= g_ghostRect.left || g_ghostRect.bottom <= g_ghostRect.top) {
-        GhostHide();
-        return;
-    }
-    if (!IsWindowVisible(g_ghost)) ShowWindow(g_ghost, SW_SHOWNA);
-    g_ghostOn = !g_ghostOn;
-    SetLayeredWindowAttributes(g_ghost, 0, g_ghostOn ? 255 : 0, LWA_ALPHA);
-}
-
 // ================================================================== 显示 / 隐藏
 static void RoundCorners(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
@@ -4402,24 +4359,22 @@ static void RoundCorners(HWND hwnd) {
 static void HidePanel() {
     Trace("HidePanel() from %p fg=%p", __builtin_return_address(0), (void*)GetForegroundWindow());
     if (g_panel && IsWindowVisible(g_panel)) {
-        // 面板自己占着前台时收起，必须把焦点还回原窗口。否则前台停在一个不可见的
-        // 窗口上，用户看到的是「原窗口莫名其妙失焦、键盘输入没有任何反应」，
-        // 再按一次 Win+V 才恢复——资源管理器里就是这么表现的。
+        // 只有输入态（用户点过搜索框）面板才持有前台，那时收起必须把焦点还回原窗口，
+        // 否则前台会停在一个不可见的窗口上：原窗口失焦、键盘输入毫无反应。
+        // 非激活态下我们从没抢过焦点，什么都不用还。
         bool hadFocus = (GetForegroundWindow() == g_panel);
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }
         if (g_resizing) { g_resizing = RS_NONE; ReleaseCapture(); }
         KillTimer(g_panel, TIMER_CARET);
         KillTimer(g_panel, TIMER_FOCUS);
         KillTimer(g_panel, TIMER_EMOJI);
-        KillTimer(g_main, TIMER_GHOST);
-        GhostHide();             // 影子光标跟着面板一起收，别在桌面上留一根线
         ShowWindow(g_panel, SW_HIDE);
         g_query.clear(); g_comp.clear();
         g_menuOpen = false;
         g_modalOpen = false;
         g_toastOn = false;
         g_pinned = false;        // 临时固定只在本次显示期间有效，关闭即取消
-        g_keepOpen = false;
+        g_inputMode = false;
         BuildView();
         if (hadFocus && g_target && g_target != g_panel && IsWindow(g_target)) {
             SetForegroundWindow(g_target);
@@ -4433,21 +4388,18 @@ static void Trace(const char* fmt, ...);
 
 static void ForceForeground(HWND hwnd);
 
-// 面板失焦后的统一判据。和早期那版「一失焦就抢回前台」的区别有两条：
-//   1) 只在唤起后的 500ms 内抢，且最多 2 次。那段时间是弹出瞬间 explorer 与前台锁
-//      互相拉扯的窗口，抢回来是对的；过了这个窗口还抢，用户主动切走就会被硬拽回来，
-//      而且抢成功后不会再有 WA_INACTIVE，面板会永久挂在最上面（早期踩过的坑）。
-//   2) 每次判断都重新读一遍前台，抢不回来就老老实实收起，不会卡在“可见但没焦点”的状态。
-static bool FocusStillOurs(HWND hwnd) {
+// 面板该不该继续留在屏幕上。取代了早期那套「失焦就抢回前台」的抢救逻辑——
+// 那套是「面板抢前台」方案下的补丁，现在根本不需要抢，判据也就直白得多：
+//   · 非激活态：面板从不改变前台，所以「前台仍是唤起时的目标窗口」就是正常状态；
+//     前台换成了别的窗口 = 用户主动切走 = 收起。
+//   · 输入态（点过搜索框）：前台就是面板自己，同样正常。
+// 这也解释了为什么不再需要 FocusStillOurs：那条路会让窗口重新激活，
+// 之后再也收不到失焦事件，面板会永久挂最上层（早期踩过的坑）。
+static bool PanelShouldStay(HWND hwnd) {
     HWND fg = GetForegroundWindow();
-    if (fg == hwnd) { g_rescueTries = 0; return true; }
-    if (GetTickCount() - g_shownAt < 500 && g_rescueTries < 2) {
-        g_rescueTries++;
-        Trace("FocusStillOurs: rescue #%d (fg=%p)", g_rescueTries, (void*)fg);
-        ForceForeground(hwnd);
-        return GetForegroundWindow() == hwnd;
-    }
-    return false;
+    if (fg == hwnd) return true;
+    if (!g_target || !IsWindow(g_target)) return true;
+    return fg == g_target;
 }
 
 static void ForceForeground(HWND hwnd) {
@@ -4474,6 +4426,7 @@ static void ForceForeground(HWND hwnd) {
         in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_MENU;
         in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_MENU;
         in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        MarkMine(in[0]); MarkMine(in[1]);
         SendInput(2, in, sizeof(INPUT));
         SetForegroundWindow(hwnd);
         SetFocus(hwnd);
@@ -4522,7 +4475,7 @@ static void ShowPanel() {
     g_drawerScroll = 0;
     g_caretOn = true;
     g_pinned = false;        // 每次打开都从未固定状态开始
-    g_keepOpen = false;
+    g_inputMode = false;     // 从非激活态开始：不碰焦点，目标窗口光标照常闪
 
     CaptureClipboard();
 
@@ -4538,12 +4491,10 @@ static void ShowPanel() {
 
     RECT caretRect{};
     bool hasCaret = false;
-    COLORREF ink = RGB(24, 26, 30);
     if (g_target && CaretRectOf(g_target, &caretRect)) {
         hasCaret = true;
         POINT c{caretRect.left, caretRect.top};
         mon = MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST);   // 光标可能跨屏
-        ink = CaretInkColor(caretRect);   // 必须在抢焦点之前采样：之后这块可能被面板盖住
     }
     g_targetTyping = hasCaret;            // 点击插入时的判据，见 PasteGlyph
 
@@ -4584,29 +4535,40 @@ static void ShowPanel() {
     if (x < minX) x = minX;
     if (y < minY) y = minY;
 
-    SetWindowPos(g_panel, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    // SWP_NOACTIVATE 是这套方案的关键：只把窗口摆上去并显示，不动前台。
+    // 目标窗口因此一直持有键盘焦点，插入符一直闪——系统 Win+V 面板就是这么做的。
+    // 面板要用到的按键由低级键盘钩子转发进来（见 LLKeyboard）。
+    SetWindowPos(g_panel, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     Trace("  after SWP_SHOWWINDOW fg=%p vis=%d", (void*)GetForegroundWindow(), (int)IsWindowVisible(g_panel));
     RoundCorners(g_panel);
-    g_shownAt = GetTickCount();
-    g_rescueTries = 0;
-    ForceForeground(g_panel);
-    // 前台锁没松开时 ForceForeground 可能失手：这时候面板已经可见却没有焦点，
-    // 150ms 后的轮询就会把它收掉，用户看到的是「按了没反应」。再补抢一次。
-    if (GetForegroundWindow() != g_panel) { g_rescueTries = 1; ForceForeground(g_panel); }
-    Trace("  after ForceForeground fg=%p vis=%d", (void*)GetForegroundWindow(), (int)IsWindowVisible(g_panel));
-    // 抢焦点会立刻让目标窗口隐藏插入符，所以影子要在抢完之后画
-    if (hasCaret) {
-        GhostShowAt(caretRect, ink);
-        SetTimer(g_main, TIMER_GHOST, 530, nullptr);
-    } else {
-        GhostHide();
-    }
     SetTimer(g_panel, TIMER_CARET, 530, nullptr);
-    SetTimer(g_panel, TIMER_FOCUS, 150, nullptr);
+    SetTimer(g_panel, TIMER_FOCUS, 120, nullptr);
     Redraw();
 }
 
 // ================================================================== 键盘钩子
+// 面板是非激活窗口（WS_EX_NOACTIVATE），永远收不到 WM_KEYDOWN / WM_CHAR，
+// 所以它需要的按键全部在这里截下来、直接喂给面板的窗口过程。这是系统 Win+V
+// 面板同款结构：焦点留在目标窗口，键盘输入由低级钩子旁路转发。
+//
+// 为什么不干脆让面板拿到焦点？因为「键盘焦点」是单一资源：面板一 SetFocus，
+// 目标窗口立刻收到 WM_KILLFOCUS 并在自己的处理里 DestroyCaret，
+// 记事本里的光标就没了。这不是能靠事后补丁补回来的（早期版本试过用替身窗口
+// 在插入符原位画一根假光标，兼容性一塌糊涂）。正解是根本不碰焦点。
+static wchar_t VkToChar(DWORD vk, DWORD scan) {
+    // 只关心不带修饰键的可见字符。Shift 用自跟踪的状态，不能用 GetAsyncKeyState：
+    // 钩子吞键之后系统的键盘状态不会更新（见 g_ctrlDown 的注释）。
+    BYTE ks[256] = {};
+    if (g_shiftDown) {
+        ks[VK_SHIFT] = 0x80;
+        ks[VK_LSHIFT] = 0x80;
+    }
+    ks[VK_CAPITAL] = (BYTE)(GetKeyState(VK_CAPITAL) & 1);
+    wchar_t buf[8] = {};
+    int n = ToUnicodeEx(vk, scan, ks, buf, 8, 0, GetKeyboardLayout(0));
+    return (n == 1) ? buf[0] : 0;      // n<0：死键，n>1：多字符序列，都不处理
+}
+
 static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         auto* k = (const KBDLLHOOKSTRUCT*)lp;
@@ -4616,6 +4578,8 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
 
         if (vk == VK_LWIN) g_lwin = down;
         if (vk == VK_RWIN) g_rwin = down;
+        if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) g_ctrlDown = down;
+        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) g_shiftDown = down;
         // 松开 Win 一并复位 V 的按下状态：万一某次 V 的 keyup 没被收到（UAC 安全桌面等），
         // 下一轮不会因为 g_vDown 卡在 true 而把正常按键当成重复键吞掉。
         if (up && (vk == VK_LWIN || vk == VK_RWIN)) g_vDown = false;
@@ -4640,6 +4604,7 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
             in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_NONAME;
             in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = VK_NONAME;
             in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            MarkMine(in[0]); MarkMine(in[1]);
             SendInput(2, in, sizeof(INPUT));
             return 1;
         }
@@ -4649,6 +4614,34 @@ static LRESULT CALLBACK LLKeyboard(int code, WPARAM wp, LPARAM lp) {
                 g_swallowVUp = false;
                 return 1;
             }
+        }
+
+        // ---- 面板打开期间的按键转发 ----
+        // 命中条件：面板可见、且前台不是面板自己（输入态下按键本来就直达面板）。
+        // 修饰键一律放行，两个原因缺一不可：
+        //   1) Win / Alt 组合要交给系统（Win+D、Alt+Tab、Alt+F4）——判据看自跟踪的
+        //      g_lwin/g_rwin 与 LLKHF_ALTDOWN；
+        //   2) **吞掉修饰键会让系统键盘状态卡死**。早期版本连 Win 的 keyup 一起吞了，
+        //      系统以为 Win 一直按着，之后注入的 Ctrl+V 被解释成 Win+Ctrl+V，
+        //      连按 Enter 都变成 Win 组合（实测直接弹出「快速设置」），
+        //      而 GetAsyncKeyState(VK_LWIN) 全程返回「按下」。
+        // 只放行「本程序自己注入的」按键（见 g_injectMark），其他来源的注入照常转发，
+        // 与真人按键一致——自动化测试才能驱动面板。
+        bool isModifier = (vk == VK_LWIN || vk == VK_RWIN ||
+                           vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                           vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+                           vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU);
+        if (g_panel && IsWindowVisible(g_panel) && GetForegroundWindow() != g_panel &&
+            k->dwExtraInfo != g_injectMark && !isModifier &&
+            !(g_lwin || g_rwin) && !(k->flags & LLKHF_ALTDOWN)) {
+            if (down) {
+                bool ctrl = g_ctrlDown;
+                wchar_t ch = ctrl ? 0 : VkToChar(vk, k->scanCode);
+                // SendMessage 而不是 PostMessage：钩子就跑在本进程 UI 线程上，
+                // 同线程 SendMessage 是直接调用，没有跨线程等待，也就不会拖慢输入。
+                SendMessageW(g_panel, WM_APP_PANELKEY, (WPARAM)vk, MAKELPARAM(ctrl ? 1 : 0, ch));
+            }
+            return 1;   // down/up 一起吞，目标窗口不会收到半截按键
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
@@ -4697,19 +4690,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring pending = g_typePending;
             g_typePending.clear();
             if (target && IsWindow(target)) {
-                // 这里必须真把前台抢回来再发按键。以前用 SetForegroundWindow 猜一下，
-                // 抢不到（前台锁）时按键会落到我们自己的面板上：面板没有文本区，
-                // DefWindowProc 对没人处理的 WM_CHAR 会响系统提示音，目标窗口则什么都没收到，
-                // 看起来就是「插入无效 + 叮一声 + 目标窗口失焦」。
-                ForceForeground(target);
+                // 非激活态下目标窗口一直持有焦点，这里一般什么都不用做。
+                // 只有用户点过搜索框（输入态）时才需要把前台交还回去。
                 if (GetForegroundWindow() != target) {
-                    Toast(L"目标窗口没有获得焦点，已取消");
-                    if (g_keepOpen) { g_keepOpen = false; ForceForeground(g_panel); }
-                    Redraw();
-                    return 0;
+                    ForceForeground(target);
+                    if (GetForegroundWindow() != target) {
+                        Toast(L"目标窗口没有获得焦点，已取消");
+                        Redraw();
+                        return 0;
+                    }
+                    // 顶层窗口回来了还不够，地址栏/搜索框那类内部焦点得手动还回去
+                    RestoreTargetFocus(target, g_targetFocus);
                 }
-                // 顶层窗口回来了还不够，地址栏/搜索框那类内部焦点得手动还回去
-                RestoreTargetFocus(target, g_targetFocus);
                 if (!pending.empty()) {
                     TypeUnicode(pending);            // 表情/符号：直插，不动剪贴板
                 } else {
@@ -4718,25 +4710,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = 'V';
                     in[2].type = INPUT_KEYBOARD; in[2].ki.wVk = 'V'; in[2].ki.dwFlags = KEYEVENTF_KEYUP;
                     in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = VK_CONTROL; in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+                    for (auto& x : in) MarkMine(x);
                     SendInput(4, in, sizeof(INPUT));
                 }
-            }
-            if (g_keepOpen) {
-                g_keepOpen = false;
-                SetTimer(g_main, TIMER_REPIN, 70, nullptr);
-            }
-        } else if (wp == TIMER_GHOST) {
-            GhostTick();
-        } else if (wp == TIMER_REPIN) {
-            KillTimer(hwnd, TIMER_REPIN);
-            // 固定态粘贴完成后把前台收回面板，接着点下一个。
-            // 收回之前先量一遍 caret：插入了字符，位置已经变了；而面板一抢到前台，
-            // 目标窗口就会销毁 caret，之后再也读不到。
-            if (g_pinned && g_panel && IsWindowVisible(g_panel)) {
-                RECT cr{}; bool have = g_target && CaretRectOf(g_target, &cr);
-                COLORREF ink = have ? CaretInkColor(cr) : g_ghostInk;
-                ForceForeground(g_panel);
-                if (have) GhostShowAt(cr, ink); else GhostHide();
+                g_inputMode = false;   // 注入完回到非激活态，焦点继续留在目标窗口
             }
         }
         return 0;
@@ -4818,23 +4795,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     wc.style = CS_DROPSHADOW;
     RegisterClassExW(&wc);
 
-    wc.lpfnWndProc = GhostProc;
-    wc.lpszClassName = GHOST_CLASS;
-    wc.style = 0;
-    RegisterClassExW(&wc);
-
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, MAIN_CLASS, L"WinVClip", WS_POPUP, 0, 0, 0, 0,
                              nullptr, nullptr, hInst, nullptr);
     if (!g_main) return 1;
 
-    g_panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, PANEL_CLASS, L"", WS_POPUP,
-                              0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
+    // WS_EX_NOACTIVATE 是「不抢焦点」方案的地基：面板从不夺取前台，
+    // 目标窗口的键盘焦点和文本插入符因此一直保留，光标照常闪烁。
+    g_panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, PANEL_CLASS,
+                              L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
     if (!g_panel) return 1;
-
-    // 影子光标：非 topmost（永远在面板之下）、click-through、不抢焦点、分层以便闪烁
-    g_ghost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
-                              WS_EX_LAYERED, GHOST_CLASS, L"", WS_POPUP,
-                              0, 0, 2, 16, nullptr, nullptr, hInst, nullptr);
 
     AddClipboardFormatListener(g_main);
 
