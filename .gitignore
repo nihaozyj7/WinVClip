@@ -1,0 +1,32 @@
+# 构建产物
+build/
+build-*/
+out/
+*.o
+*.obj
+*.exe
+*.ilk
+*.pdb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试/调试产物
+*.log
+_panel_*.png
+panel_*.png
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
