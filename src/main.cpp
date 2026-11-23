@@ -53,11 +53,7 @@ using namespace wv;
 #include "diag.h"
 #include "io_png.h"
 #include "model.h"
-
-// 页面
-enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };
-// 筛选
-enum { FL_ALL = 0, FL_TEXT, FL_IMAGE, FL_OTHER, FL_COUNT };
+#include "app_state.h"
 
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10,
        WM_APP_HIDE_OUTSIDE = WM_APP + 11 };
@@ -69,153 +65,10 @@ enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET
 
 // Thumb / ClipItem / GItem / GCat / RecentGlyph 见 model.h
 
-static HHOOK  g_hook  = nullptr;      // 低级键盘：Win+V 热键 + 面板按键转发
-static HHOOK  g_mouseHook = nullptr;  // 低级鼠标：点面板外部即收起
-static HWND   g_main  = nullptr;
-static HWND   g_panel = nullptr;
-static HWND   g_target = nullptr;
-static HWND   g_pasteTarget = nullptr;
-// 唤起面板时，目标窗口内部那个有焦点的控件（地址栏的编辑框、搜索框…）。
-// SetForegroundWindow 只还原顶层窗口，控件级焦点得靠它自己处理：记事本能找回，
-// 资源管理器的地址栏 / 搜索框不能——那样粘过去的 Ctrl+V 会落到一个没有焦点的
-// 窗口上，表现就是「面板选完条目，输入框里什么都没出现」。
-static HWND   g_targetFocus = nullptr;
-
-static bool   g_lwin = false, g_rwin = false;
-// 修饰键状态必须自己跟踪：钩子吞掉按键后系统不会更新全局键盘状态，
-// GetAsyncKeyState / GetKeyState 在回调里都会读到「没按下」，Ctrl+1 因此会被
-// 误当成字符 '1' 打进搜索框（早期实测踩过）。
-static bool   g_ctrlDown = false, g_shiftDown = false;
-static bool   g_swallowVUp = false;
-static bool   g_vDown = false;       // V 当前是否处于按下（用来识别长按产生的自动重复键）
-static DWORD  g_vDownAt = 0;
-// 已经吞下 keydown 的键，等它的 keyup 一起吞。不配对的话目标窗口会收到一个
-// 没有 down 的 up，个别程序会把它当成一次组合键的结束。面板收起时清空。
-static bool   g_swallowed[256] = {};
-
-// 自己注入的按键统一打上这个标记。钩子靠它区分「本程序注入」和「其他来源的注入」：
-// 前者必须放行（否则固定态连着插表情时，自己注入的字符会被自己的钩子吞掉），
-// 后者照常转发给面板，跟真人按键一视同仁——自动化测试也正是靠这一点才能驱动面板。
-static const ULONG_PTR g_injectMark = 0x57494E56;   // 'WINV'
+// 自己注入的按键统一打上标记（g_injectMark 见 app_state.h）：
+// 钩子靠它区分「本程序注入」与「其他来源的注入」——后者要照常转发给面板，
+// 自动化测试正是靠这一点才能驱动面板。
 static void MarkMine(INPUT& in) { in.ki.dwExtraInfo = g_injectMark; }
-
-// 面板的两种活法（关键设计，见文件末尾「焦点模型」一节）：
-//   false = 非激活态（默认）。面板带 WS_EX_NOACTIVATE，从不夺取前台，目标窗口的
-//           键盘焦点和文本插入符一直保留着；面板要用的按键由低级键盘钩子转发进来。
-//           这正是系统 Win+V 面板的做法——光标不消失的根本原因是「从来没抢过焦点」。
-//   true  = 输入态。用户点了搜索框才把前台交给面板，用于输入法（中文）组合——
-//           IME 必须有真正的键盘焦点才工作。此时光标消失是用户主动进入搜索态的代价，
-//           按 Esc 结束搜索就还回去。
-
-static std::deque<ClipItem> g_items;
-
-// 视图状态
-static int g_page = PG_HISTORY;
-static int g_filter = FL_ALL;
-static std::wstring g_query;
-static std::wstring g_comp;      // IME 组合串（尚未上屏）：只用于显示与光标定位
-static std::vector<int> g_view;
-static int g_sel = 0, g_top = 0, g_hoverRow = -1, g_hoverChip = -1;
-static int g_hoverCell = -1;
-static int g_emojiCat = 0, g_symCat = 0;   // 0 = 「最近使用」，n≥1 对应 g_emoCats / g_symCats[n-1]
-
-// toast
-static std::wstring g_toast;
-static bool g_toastOn = false, g_toastInfo = false;
-
-// 菜单 / 弹层
-static bool g_menuOpen = false;
-static int  g_menuRow = -1, g_menuHover = -1;
-static int  g_menuItem = -1;       // 呼出菜单时锁定的条目在 g_items 中的绝对下标
-static POINT g_menuPt{0, 0};       // 右键呼出菜单时的光标位置（客户区坐标）
-static bool g_dialogOpen = false;  // 文件对话框打开期间禁止「失焦即隐藏」
-
-// 标题栏拖动
-static bool  g_dragging = false;
-static POINT g_dragFrom{0, 0};     // 按下时的屏幕坐标
-static RECT  g_dragRect{0, 0, 0, 0}; // 按下时的窗口位置
-static bool g_modalOpen = false;
-static int  g_modalRow = -1;
-// 「点外面收起」这条路上不许抢前台：用户点的窗口正等着激活，HidePanel 若趁机
-// SetForegroundWindow(g_target) 就会把前台拽回去（前台锁会让用户那次点击落空）。
-static bool g_hideNoRestore = false;
-
-static bool g_pinned = false;        // 临时固定：本次显示期间不失焦隐藏 + 置顶，关闭后自动取消
-static std::wstring g_typePending;   // 待注入的文本（表情/符号直插，不经剪贴板）
-
-// 「临时借用剪贴板」：给不接受字符注入的目标窗口准备的粘贴通道。
-// 借用期间把原剪贴板内容备份下来，粘完还原；借用产生的剪贴板变化不进历史。
-struct ClipBak {
-    bool valid = false;
-    bool hadText = false;
-    std::wstring text;
-    std::vector<std::wstring> files;
-    std::vector<BYTE> png, dib;
-};
-static ClipBak g_clipBak;
-static bool    g_borrowedClip = false;   // 正在借用中（备份已做、尚未还原）
-// 我方最后一次写剪贴板产生的序列号：既用于跳过「自己写的」捕获，也用于还原前的安全检查
-static DWORD   g_selfClipSeq = 0;
-
-// 面板尺寸：g_panelW/H 是本次显示的实际值，g_savedW/H 是上次调整后落盘的值
-static int g_panelW = 0, g_panelH = 0;
-static int g_savedW = 0, g_savedH = 0;
-// 拖拽改变尺寸（不用系统的 HTLEFT/HTBOTTOMRIGHT：那是模态循环，会被「失焦即隐藏」打断）
-static int   g_resizing = 0;
-static POINT g_rsFrom{0, 0};
-static RECT  g_rsRect{0, 0, 0, 0};
-enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
-
-static bool g_caretOn = true;
-static int  g_gridScroll = 0;      // 表情/符号页的纵向滚动（像素）
-// 用户自己拖过面板 / 改过尺寸：这次的自动定位就作废，别再把他摆好的面板挪走
-static bool g_posUserSet = false;
-// 首次探测不到插入符时的补探测次数（Chromium 的可访问性树是懒建的，第一次问常常还没建好）
-static int  g_reprobeLeft = 0;
-
-// 面板是否处于「输入态」：见文件开头焦点模型的说明
-static bool     g_inputMode = false;
-// 钩子转发给面板的按键消息（wParam=vk，lParam=MAKELPARAM(ctrl, ch)）
-enum { WM_APP_PANELKEY = WM_APP + 3 };
-
-static int g_dpi = 96;
-static HFONT g_fTitle = nullptr, g_fMeta = nullptr, g_fTab = nullptr, g_fChip = nullptr,
-             g_fSearch = nullptr, g_fMono = nullptr, g_fEmoji = nullptr, g_fSym = nullptr,
-             g_fKbd = nullptr, g_fBig = nullptr, g_fToast = nullptr, g_fSymName = nullptr;
-static HDC   g_ref = nullptr;          // 量文字用的屏幕 DC
-static NOTIFYICONDATAW g_nid{};
-static bool  g_tray = false;
-static UINT  g_cfPng = 0;
-
-static ID2D1Factory*          g_d2d = nullptr;
-static IDWriteFactory*        g_dw = nullptr;
-static ID2D1DCRenderTarget*   g_rt = nullptr;
-static HFONT g_fSymFallback[3] = {};   // 符号字体兜底（见 PickSymFont）
-static std::unordered_map<std::wstring, int> g_symFontSlot;
-static IDWriteFont* g_probe[5] = {};   // 字体覆盖度探测对象（0-3 符号候选，4 = Segoe UI Emoji）
-static IDWriteTextFormat*     g_emojiFmt = nullptr;
-static ID2D1SolidColorBrush*  g_brush = nullptr;       // 全局面刷（换色复用）
-static ID2D1StrokeStyle*      g_roundStroke = nullptr; // 圆头圆角笔触
-static IDWriteInlineObject*   g_ellipsis = nullptr;    // 省略号 trimming sign
-static bool                   g_painting = false;      // 是否处于 D2D batch 内
-static std::unordered_map<HFONT, IDWriteTextFormat*> g_tfmt; // HFONT → DWrite 格式
-
-// ------------------------------------------------ 性能探针 / 诊断日志
-// 实现在 diag.cpp：PerfAcc / g_perfOn / g_perfFreq / PerfNow / PerfMs /
-// PerfAppend / PerfInit / WarmLog / Trace。汇总输出 PerfFlush 仍在下方，
-// 因为它要连同当前页与表情命中率一起写，属于业务侧的知识。
-
-static std::vector<GCat>    g_symCats, g_emoCats;
-static std::vector<RecentGlyph> g_recentSym, g_recentEmo;
-static std::vector<GItem>   g_recentSymItems, g_recentEmoItems;
-static int g_recentCount[2] = {0, 0};      // [0]=表情 [1]=符号：过滤后还剩几条「最近」
-static std::vector<GItem>   g_glyphHits;      // 跨分类搜索结果（搜索时替代分类条目）
-static std::wstring         g_hitsQuery;      // 命中所对应的查询串
-static int                  g_hitsPage = -1;
-
-// 分类抽屉
-static bool g_drawerOpen = false;
-static int  g_drawerScroll = 0, g_drawerHover = -1, g_drawerContentH = 0;
 
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
 
