@@ -1,0 +1,16 @@
+# 行尾与二进制
+
+# 不做全局行尾归一：本仓库 .git 配置为 core.autocrlf=true，工作树是 CRLF。
+# 若在此处强制 eol=lf，会让每个源文件产生一次全文件 diff，掩盖真实改动。
+* text=auto
+
+# 二进制：禁止任何换行/合并算法介入
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+
+# 必须保持 CRLF 的脚本
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

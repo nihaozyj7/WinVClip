@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # 往剪贴板塞测试图片：PNG 格式 / CF_DIB 格式 / 带透明通道的 PNG
 # 用法: python test_clip.py png|dib|alpha|all
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, io, sys, time
 from ctypes import wintypes
 from PIL import Image, ImageDraw

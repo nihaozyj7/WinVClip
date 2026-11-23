@@ -4,6 +4,9 @@
 流程：起记事本 → Win+V（非固定态）→ 切表情页 → 搜索 cat → 点第一格
 检查：剪贴板仍是哨兵；记事本多了一个彩色 emoji。
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, sys, time
 from ctypes import wintypes
 

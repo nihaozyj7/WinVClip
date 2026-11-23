@@ -2,6 +2,9 @@
 """验证：在资源管理器地址栏里唤出面板并粘贴，内容要真的进到地址栏。
 步骤：地址栏输入 ZZZ -> Win+V -> Enter 粘第一条 -> Ctrl+A/Ctrl+C 读回地址栏文本。
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, time
 from ctypes import wintypes
 

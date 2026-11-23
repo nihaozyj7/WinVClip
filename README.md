@@ -3,11 +3,23 @@
 纯 Win32 C++ 实现，无第三方依赖（只多用了系统自带的 Direct2D / DirectWrite 画彩色 emoji）。
 **完全接管 Win+V**：原生命令板不会出现，弹的是这个程序自己的面板。
 
-面板视觉按 `index.html` 视觉稿（Clipboard Reliquary · PC Panel · 560 × 620）1:1 还原：
+面板视觉按设计稿（Clipboard Reliquary · PC Panel · 560 × 620）1:1 还原：
 浅色纸感配色、标题栏内嵌页签、搜索框、分类 chip 条、56px 列表行、底部提示条、
-右上角 toast、自定义右键菜单、删除确认弹层。
+右上角 toast、自定义右键菜单、删除确认弹层。配色与尺寸常量集中在 `src/theme.h`。
 
-![表情页](preview-emoji.png)
+![表情页](docs/preview-emoji.png)
+
+## 目录结构
+
+```
+src/         C++ 源码（按职责分文件，见 src/README.md）
+tests/       回归测试（21 个，直接跑单个脚本即可，见 tests/README.md）
+tools/       一次性诊断/测量/生成脚本（不是构建的一部分）
+docs/        审查报告与截图
+build/       构建产物（不入库）
+```
+
+改代码前先读 `src/README.md` 的「文件职责」表，确认该改哪个文件。
 
 ## 用法
 

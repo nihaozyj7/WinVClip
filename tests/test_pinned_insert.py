@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """验证临时固定态：连点多个表情，面板不消失、剪贴板不动、都能插进去。"""
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, time
 from ctypes import wintypes
 

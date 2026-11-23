@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """验证：唤出面板再关掉之后，资源管理器地址栏的焦点要回来，能继续打字。
 做法：地址栏输入 ZZZ -> Win+V -> Esc -> 输入 AAA -> Ctrl+A/Ctrl+C 读回。"""
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, time
 from ctypes import wintypes
 

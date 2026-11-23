@@ -6,6 +6,9 @@
   python test_glyph_ui.py click X Y       # 向面板投递一次左键单击（客户区坐标）
   python test_glyph_ui.py state           # 打印面板可见性 / 矩形
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, sys, time
 from ctypes import wintypes
 

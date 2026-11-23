@@ -5,6 +5,9 @@
 纹丝不动，旧的轮询判据永远看不到变化，面板会僵在屏幕上。这里验证新加的低级
 鼠标钩子通道真的把它收起来了，而且这次点击照常送到网页、浏览器仍是前台。
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, sys, time
 from ctypes import wintypes
 

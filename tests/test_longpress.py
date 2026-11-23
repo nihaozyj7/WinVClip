@@ -6,6 +6,9 @@
     python test_longpress.py            # 长按 1.5 秒
     python test_longpress.py hold 3     # 长按 3 秒
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, sys, time
 from ctypes import wintypes
 

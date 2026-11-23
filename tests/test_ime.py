@@ -9,6 +9,9 @@
 注意：这里必须用 SendInput 发 VK（而不是 KEYEVENTF_UNICODE），
       只有真实键盘事件才会被输入法拦截成组合串。
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, sys, time
 from ctypes import wintypes
 

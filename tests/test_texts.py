@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 # 依次往剪贴板塞若干条文本，每条之间留出时间给监听程序捕获
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, time
 from ctypes import wintypes
 

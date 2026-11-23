@@ -5,6 +5,9 @@
   python test_resize.py state
   python test_resize.py reset     # 删掉记忆文件（下次启动回到默认尺寸）
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, os, sys, time
 from ctypes import wintypes
 

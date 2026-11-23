@@ -14,6 +14,9 @@ C 非激活态 Esc → 监听收不到（面板消费），面板收起
 
 用法：python test_hook_passthrough.py
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, os, subprocess, sys, time
 from ctypes import wintypes
 
@@ -22,7 +25,7 @@ k32 = ctypes.windll.kernel32
 u.FindWindowW.restype = ctypes.c_void_p
 u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根（P0 后脚本位于 tests/）
 EXE = os.path.join(HERE, "build", "winvclip.exe")
 TMP = os.environ.get("TEMP", ".")
 HLOG = os.path.join(TMP, "hooklog.txt")

@@ -9,6 +9,9 @@
 期望：目标拿到 emoji；`clip after insert` 仍是哨兵 ORIGINAL-ABC。
 用法: python test_glyph_channel.py notepad|web|explorer [shift]
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, sys, time, urllib.parse
 from ctypes import wintypes
 

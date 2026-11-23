@@ -15,6 +15,9 @@
 
 用法：python test_hide_outside.py
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, sys, time
 from ctypes import wintypes
 

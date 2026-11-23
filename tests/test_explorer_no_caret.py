@@ -12,6 +12,9 @@
 
 期望：面板收起（正常走完插入流程）、剪贴板仍是哨兵、explorer 前台不乱。
 """
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, time
 from ctypes import wintypes
 

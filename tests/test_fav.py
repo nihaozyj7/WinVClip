@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """收藏页回归：Ctrl+D 收藏一条 → 切到收藏页 → 点第一行，应粘贴到目标窗口。"""
+# --- 路径基准：从 tests/ 回到项目根（P0 结构整理时注入） ---
+import os as _os, sys as _sys
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import ctypes, subprocess, time
 from ctypes import wintypes
 
