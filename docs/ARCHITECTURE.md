@@ -122,4 +122,17 @@ src/
 3. 需要新矩形吗？加进 `Layout`，在 `ComputeLayout` 里算。
 4. 需要新动作吗？放进 `ui/actions.cpp`，不要在 `PanelProc` 的 case 里写逻辑
    （同一个动作常被菜单、快捷键、鼠标三条路径触发）。
-5. 改完跑：`cmake --build build`（要求零警告）+ `tests/` 里相关用例。
+5. 改完跑：`cmake --build build`（要求零警告）+ `python tests\run.py`（desktop 组约 100 秒）。
+
+## 测试层
+
+| 文件 | 职责 |
+|---|---|
+| `tests/wvclip.py` | 公共层：Win32 绑定（argtypes 齐全）、键鼠注入、剪贴板、窗口查询、断言辅助 |
+| `tests/run.py` | runner：发现/分组/超时/汇总，零第三方依赖 |
+| `tests/test_*.py` | 用例，也能单独 `python tests\test_xxx.py` 运行 |
+
+分组表只在 `run.py` 顶部维护：desktop（自带前置，默认跑）/ manual（需外部条件）/
+driver（造数据工具，非用例）。新增用例只写自己的用例体，键鼠与窗口操作一律走公共层——
+`post_click`（消息投递，驱动 NOACTIVATE 面板）与 `real_click`（真实鼠标，验证低级钩子）
+语义不同，不能混用。详见 `tests/README.md`。
