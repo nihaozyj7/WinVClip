@@ -14,6 +14,7 @@
 #include "core/app_state.h"    // 全部视图状态与设备对象
 #include "core/diag.h"
 #include "core/model.h"
+#include "core/settings.h"    // g_cfg（设置窗口要画当前值）
 #include "core/text_measure.h" // Fmt / TextW
 #include "core/text_util.h"
 #include "core/theme.h"
@@ -27,6 +28,7 @@
 #include "render/fonts.h"
 #include "render/icons.h"
 #include "render/path.h"
+#include "ui/actions.h"       // ClearHistoryCount（清空确认卡片的文案要显示条数）
 #include "ui/layout.h"
 
 using namespace wv;
@@ -261,9 +263,10 @@ void PaintRow(HDC dc, int i) {
         FillRound(dc, r, S(8), C_CANVAS, C_CANVAS, 0);
     }
 
-    // 类型徽标 / 图片缩略图
-    RECT ic{r.left + S(10), r.top + (S(ROW_H) - S(28)) / 2,
-            r.left + S(10) + S(28), r.top + (S(ROW_H) - S(28)) / 2 + S(28)};
+    // 类型徽标 / 图片缩略图（垂直居中按这一行的实际高度算：行高会随面板高度微调）
+    int rh = r.bottom - r.top;
+    RECT ic{r.left + S(10), r.top + (rh - S(28)) / 2,
+            r.left + S(10) + S(28), r.top + (rh - S(28)) / 2 + S(28)};
     if (!DrawThumb(dc, it, ic)) {
         FillRound(dc, ic, S(6), C_SUBTLE, C_SUBTLE, 0);
         RECT ii = ic; InflateRect(&ii, -S(7), -S(7));
@@ -435,32 +438,11 @@ void PaintSymbols(HDC dc) {
     }
 }
 
-// 细滚动条（对应 CSS 的 8px thumb）
-int GridContentH();
-
+// 细滚动条（对应 CSS 的 8px thumb）。几何在 ComputeScrollbar 里算好（layout.cpp），
+// 这里只画：拖拽命中读的是同一份矩形，两边不会错位。
 void PaintScrollbar(HDC dc) {
-    int contentH = 0, viewH = L.body.bottom - L.body.top, offset = 0;
-    if (g_page == PG_HISTORY || g_page == PG_FAV) {
-        contentH = S(8) + (int)g_view.size() * S(ROW_H) + S(12);
-        offset = g_top * S(ROW_H);
-    } else {
-        contentH = GridContentH();
-        offset = g_gridScroll;
-    }
-    if (contentH <= viewH) return;
-
-    int trackTop = L.body.top + S(4);
-    int trackBot = L.body.bottom - S(4);
-    int trackH = trackBot - trackTop;
-    int thumbH = (std::max)(S(28), (int)((long long)trackH * viewH / contentH));
-    int maxOffset = contentH - viewH;
-    if (maxOffset < 1) maxOffset = 1;
-    int thumbTop = trackTop + (int)((long long)(trackH - thumbH) * offset / maxOffset);
-    if (thumbTop < trackTop) thumbTop = trackTop;
-    if (thumbTop + thumbH > trackBot) thumbTop = trackBot - thumbH;
-
-    RECT tb{L.W - S(8), thumbTop, L.W - S(3), thumbTop + thumbH};
-    FillRound(dc, tb, S(2), RGB(196, 190, 181), RGB(196, 190, 181), 0);
+    if (L.scrollMax <= 0 || L.scrollThumb.right <= L.scrollThumb.left) return;
+    FillRound(dc, L.scrollThumb, S(2), RGB(196, 190, 181), RGB(196, 190, 181), 0);
 }
 
 // ---------------------------------------------------------------- 分类抽屉绘制
@@ -578,15 +560,6 @@ void PaintToast(HDC dc) {
     TextOutF(dc, g_fToast, C_SURFACE, g_toast, tt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 }
 
-// 菜单：置顶（文案随状态变）/ 另存为 /（分隔线）删除
-const wchar_t* MenuLabel(int idx, const ClipItem* it) {
-    switch (idx) {
-    case MI_PIN:  return (it && it->pinned) ? L"取消置顶" : L"置顶";
-    case MI_SAVE: return L"另存为…";
-    default:      return L"删除";
-    }
-}
-
 void PaintMenu(HDC dc) {
     if (!g_menuOpen) return;
     RECT m = MenuRect();
@@ -596,37 +569,52 @@ void PaintMenu(HDC dc) {
     int sepY = MenuItemRect(MENU_SEP_BEFORE).top - S(MENU_SEP_H / 2);
     HLine(dc, m.left + S(10), m.right - S(10), sepY, C_LINE);
 
-    const ClipItem* it = (g_menuItem >= 0 && g_menuItem < (int)g_items.size())
-                         ? &g_items[g_menuItem] : nullptr;
+    bool pinned = (g_menuItem >= 0 && g_menuItem < (int)g_items.size())
+                  && g_items[g_menuItem].pinned;
     for (int i = 0; i < MI_COUNT; ++i) {
         RECT ir = MenuItemRect(i);
         if (g_menuHover == i) FillRound(dc, ir, S(6), C_CANVAS, C_CANVAS, 0);
-        RECT ii{ir.left + S(9), ir.top + (S(34) - S(15)) / 2,
-                ir.left + S(9) + S(15), ir.top + (S(34) - S(15)) / 2 + S(15)};
         COLORREF tc = (i == MI_DELETE) ? C_DANGER : C_INK;
         IconId ic = (i == MI_PIN) ? IC_PIN : (i == MI_SAVE ? IC_SAVE : IC_TRASH);
-        DrawIcon(dc, ic, ii, tc, 1.9f);
-        RECT tr{ii.right + S(9), ir.top, ir.right - S(8), ir.bottom};
-        TextOutF(dc, g_fChip, tc, MenuLabel(i, it), tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        DrawIcon(dc, ic, MenuItemIconRect(i), tc, 1.9f);
+        RECT tr = MenuItemTextRect(i);
+        TextOutF(dc, g_fChip, tc, MenuLabel(i, pinned), tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     }
 }
 
+void PaintConfirmCard(HDC dc, const RECT& m);
+
 void PaintModal(HDC dc) {
     if (!g_modalOpen) return;
-    // 遮罩：rgba(32,37,43,.28) —— D2D 直接做 source-over，比手工拼预乘 DIB 更准
+    // 遮罩：rgba(32,37,43,.28) —— D2D 直接做 source-over，比手工拼预乘 DIB 更准。
     if (g_rt && g_painting) {
-        Brush(C_INK, 0.28f);
+        Brush(C_SCRIM, 0.28f);
         g_rt->FillRectangle(D2D1::RectF(0, 0, (float)L.W, (float)L.H), g_brush);
     }
+    PaintConfirmCard(dc, ModalRect());
+}
 
-    RECT m = ModalRect();
+// 确认卡片本体（不含遮罩）：面板里的「删除这条」用它，设置窗口里的「清空历史」也用它。
+// 几何由调用方给——两边各在自己的坐标系里居中（见 layout.cpp 的 ModalRect / SettingsModalRect）。
+void PaintConfirmCard(HDC dc, const RECT& m) {
+    bool clear = (g_modalKind == MODAL_CLEAR_HIST);
     FillRound(dc, m, S(8), C_SURFACE, C_LINE);
 
     RECT h3{m.left + S(20), m.top + S(20), m.right - S(20), m.top + S(20) + S(22)};
-    TextOutF(dc, g_fBig, C_INK, L"删除这条剪贴板项目？", h3,
+    TextOutF(dc, g_fBig, C_INK, clear ? L"清空剪贴板历史？" : L"删除这条剪贴板项目？", h3,
              DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     RECT p{m.left + S(20), h3.bottom + S(6), m.right - S(20), h3.bottom + S(6) + S(20)};
-    TextOutF(dc, g_fMeta, C_MUTED, L"删除后无法恢复。", p, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    if (clear) {
+        // 两行说明：会删几条 / 什么会被保留。后者是这个操作能不能被放心点的前提。
+        TextOutF(dc, g_fMeta, C_MUTED,
+                 L"将删除 " + std::to_wstring(ClearHistoryCount()) + L" 条记录，无法恢复。", p,
+                 DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        RECT p2{p.left, p.bottom + S(2), p.right, p.bottom + S(2) + S(20)};
+        TextOutF(dc, g_fMeta, C_MUTED, L"置顶与收藏的条目会保留。", p2,
+                 DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    } else {
+        TextOutF(dc, g_fMeta, C_MUTED, L"删除后无法恢复。", p, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    }
 
     int bw = (m.right - m.left - S(40) - S(8)) / 2;
     int by = m.bottom - S(20) - S(38);
@@ -634,8 +622,120 @@ void PaintModal(HDC dc) {
     RECT cc{ok.right + S(8), by, ok.right + S(8) + bw, by + S(38)};
     FillRound(dc, ok, S(8), C_SURFACE, C_DANGER);
     FillRound(dc, cc, S(8), C_SURFACE, C_LINE);
-    TextOutF(dc, g_fChip, C_DANGER, L"删除", ok, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    TextOutF(dc, g_fChip, C_DANGER, clear ? L"清空" : L"删除", ok,
+             DT_SINGLELINE | DT_VCENTER | DT_CENTER);
     TextOutF(dc, g_fChip, C_INK, L"取消", cc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+}
+
+// ================================================================== 设置窗口
+// 七行的开关/按钮外观。数值（on/off、主题、目录、上限）全部来自 g_cfg，
+// 绘制本身不改任何东西（改了就得回写配置文件，那是 actions 的事）。
+static void PaintSwitch(HDC dc, const RECT& r, bool on, bool hover) {
+    int rad = r.bottom - r.top;
+    FillRound(dc, r, rad, on ? C_VOLT : (hover ? C_LINE : C_SUBTLE), on ? C_VOLT : C_LINE, 1);
+    int kd = rad - S(4);
+    int kx = on ? r.right - S(2) - kd : r.left + S(2);
+    RECT knob{kx, r.top + S(2), kx + kd, r.bottom - S(2)};
+    FillRound(dc, knob, kd, C_SURFACE, C_SURFACE, 0);
+}
+
+static void PaintSegBtn(HDC dc, const RECT& r, const wchar_t* label, bool on, bool hover) {
+    FillRound(dc, r, S(8), on ? C_VOLT : (hover ? C_SUBTLE : C_CANVAS), on ? C_VOLT : C_LINE, 1);
+    TextOutF(dc, g_fChip, on ? RGB(255, 255, 255) : C_INK, label, r,
+             DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+}
+
+// 左侧标签，超宽时自己截断（DWrite 的 trimming 在 TextOutF 里被关掉了，见 dc.cpp）
+static std::wstring EllipText(HFONT f, const std::wstring& s, int maxW) {
+    if (maxW <= 0) return std::wstring();
+    if (TextW(f, s) <= maxW) return s;
+    std::wstring out = s;
+    while (!out.empty() && TextW(f, out + L"…") > maxW) out.pop_back();
+    return out + L"…";
+}
+
+void PaintSettings(HDC dc) {
+    if (!g_settingsOpen) return;
+    RECT c = L.setCard;
+    FillRound(dc, c, S(12), C_SURFACE, C_LINE);
+
+    // 标题 + 关闭按钮
+    RECT t{c.left + S(18), c.top + S(6), L.setClose.left - S(6), c.top + S(40)};
+    TextOutF(dc, g_fBig, C_INK, L"设置", t, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    bool hc = (g_setHover == SET_CLOSE);
+    if (hc) FillRound(dc, L.setClose, S(6), C_CANVAS, C_CANVAS, 0);
+    DrawIcon(dc, IC_X, CenterIcon(L.setClose, S(15)), hc ? C_INK : C_MUTED, 2.0f);
+    HLine(dc, c.left + S(1), c.right - S(1), L.setRow[0].top - S(6), C_LINE);
+
+    static const wchar_t* LABEL[SET_ROW_COUNT] = {L"开机自启动", L"以管理员身份运行", L"主题",
+                                                  L"临时文件目录", L"剪贴板记录上限",
+                                                  L"删除前二次确认", L"清空剪贴板历史"};
+
+    for (int i = 0; i < SET_ROW_COUNT; ++i) {
+        const RECT& row = L.setRow[i];
+        // 标签可用宽度：右边界取该行最靠左的控件，留 12px 间隔
+        int si = SetSwitchOfRow(i);
+        int ctrlLeft = row.right;
+        if (si >= 0) ctrlLeft = L.setSw[si].left;
+        else if (i == SET_ROW_THEME) ctrlLeft = L.setSeg[0].left;
+        else if (i == SET_ROW_TEMP)  ctrlLeft = L.setBrowse.left;
+        else if (i == SET_ROW_CLEAR) ctrlLeft = L.setClear.left;
+        else ctrlLeft = L.setMinus.left;
+
+        if (i == SET_ROW_TEMP) {
+            // 这行要放两段文字：标题在上、路径在下
+            RECT lt{row.left, row.top + S(8), ctrlLeft - S(12), row.top + S(30)};
+            TextOutF(dc, g_fChip, C_INK, LABEL[i], lt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            std::wstring dir = g_cfg.tempDir.empty() ? DefaultTempDir() : g_cfg.tempDir;
+            RECT pt{row.left, row.top + S(30), ctrlLeft - S(12), row.top + S(52)};
+            TextOutF(dc, g_fMeta, C_MUTED, EllipText(g_fMeta, dir, pt.right - pt.left), pt,
+                     DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        } else if (i == SET_ROW_CLEAR) {
+            // 同样是两段字：标题在上、「保留什么」在下。后者必须让用户看见，
+            // 否则没人敢点这个红按钮。
+            RECT lt{row.left, row.top + S(8), ctrlLeft - S(12), row.top + S(32)};
+            TextOutF(dc, g_fChip, C_INK, LABEL[i], lt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+            RECT st{row.left, row.top + S(32), ctrlLeft - S(12), row.top + S(56)};
+            TextOutF(dc, g_fMeta, C_MUTED, L"置顶与收藏的条目会保留", st,
+                     DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        } else {
+            RECT lt{row.left, row.top, ctrlLeft - S(12), row.bottom};
+            TextOutF(dc, g_fChip, C_INK, LABEL[i], lt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        }
+
+        if (si >= 0) {
+            bool on = (si == 0) ? g_cfg.autostart
+                    : (si == 1) ? g_cfg.admin
+                                : g_cfg.confirmDelete;
+            PaintSwitch(dc, L.setSw[si], on, g_setHover == (SET_SW_AUTO + si));
+        } else if (i == SET_ROW_THEME) {
+            static const wchar_t* SEG[3] = {L"浅色", L"暗色", L"跟随系统"};
+            for (int k = 0; k < 3; ++k) {
+                PaintSegBtn(dc, L.setSeg[k], SEG[k], g_cfg.theme == k,
+                            g_setHover == (SET_SEG_0 + k));
+            }
+        } else if (i == SET_ROW_TEMP) {
+            bool hb = (g_setHover == SET_BROWSE);
+            FillRound(dc, L.setBrowse, S(8), hb ? C_SUBTLE : C_CANVAS, C_LINE, 1);
+            TextOutF(dc, g_fChip, C_INK, L"更改…", L.setBrowse,
+                     DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        } else if (i == SET_ROW_CLEAR) {
+            // 危险按钮：悬停只提亮底色，边框和文字一直是 C_DANGER
+            bool hk = (g_setHover == SET_CLEAR);
+            FillRound(dc, L.setClear, S(8), hk ? C_SUBTLE : C_CANVAS, C_DANGER, 1);
+            TextOutF(dc, g_fChip, C_DANGER, L"清空", L.setClear,
+                     DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        } else {
+            bool hm = (g_setHover == SET_MINUS), hp = (g_setHover == SET_PLUS);
+            FillRound(dc, L.setMinus, S(8), hm ? C_SUBTLE : C_CANVAS, C_LINE, 1);
+            FillRound(dc, L.setPlus, S(8), hp ? C_SUBTLE : C_CANVAS, C_LINE, 1);
+            FillRound(dc, L.setValue, S(8), C_CANVAS, C_LINE, 1);
+            TextOutF(dc, g_fChip, C_INK, L"−", L.setMinus, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            TextOutF(dc, g_fChip, C_INK, L"+", L.setPlus, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            TextOutF(dc, g_fChip, C_INK, std::to_wstring(g_cfg.historyLimit), L.setValue,
+                     DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        }
+    }
 }
 
 // PerfAppend / PerfInit 见 diag.cpp；下面是带业务语义的汇总输出。
@@ -695,6 +795,46 @@ bool AcquireBackBuffer(HDC ref, int W, int H) {
 
 bool RectsOverlap(const RECT& a, const RECT& b) {
     return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+// ---------------------------------------------------------------- 设置窗口
+// 设置窗口里的提示条：设置项改完的反馈（尤其是失败原因）必须看得见，
+// 所以不跟面板共用 toast 几何，而是占窗口底部预留的那一条。
+static void PaintSettingsToast(HDC dc) {
+    if (!g_toastOn || g_toast.empty()) return;
+    int maxW = (L.setCard.right - L.setCard.left) - S(36);
+    std::wstring txt = EllipText(g_fToast, g_toast, maxW - S(30));
+    int w = TextW(g_fToast, txt) + S(30);
+    int right = L.setCard.right - S(18);
+    int top = L.setCard.bottom - S(16) - S(26);
+    RECT t{right - w, top, right, top + S(26)};
+    FillRound(dc, t, S(8), C_INK, C_INK, 0);
+    TextOutF(dc, g_fToast, C_SURFACE, txt, t, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+}
+
+// 设置窗口的整帧绘制。它与 PaintPanel 共用同一块离屏缓冲与同一个 DCRenderTarget
+// （见 AcquireBackBuffer 的尺寸判断）：两个窗口从不同时重绘，尺寸不同时缓冲会重建，
+// 所以不需要第二套设备。
+void PaintSettingsWindow(HWND hwnd) {
+    EnsureD2D();          // 闲置回收可能把设备放掉了（见 showhide.cpp）
+    PAINTSTRUCT ps;
+    HDC dc0 = BeginPaint(hwnd, &ps);
+    RECT rc; GetClientRect(hwnd, &rc);
+    if (!AcquireBackBuffer(dc0, rc.right, rc.bottom)) { EndPaint(hwnd, &ps); return; }
+    HDC dc = g_bbDc;
+
+    ComputeSettings(rc.right, rc.bottom);   // 几何跟着实际客户区（客户区就是卡片）
+    PaintBegin(dc, rc.right, rc.bottom, nullptr);
+    FillBox(dc, rc, C_SURFACE);
+    PaintSettings(dc);
+    PaintSettingsToast(dc);
+    // 清空历史是从设置里点出来的：确认卡片必须在设置窗口里出现，
+    // 否则点完「清空」屏幕上什么都不会发生（面板此刻是隐藏的）。
+    if (g_modalOpen) PaintConfirmCard(dc, SettingsModalRect());
+    PaintEnd();
+
+    BitBlt(dc0, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    EndPaint(hwnd, &ps);
 }
 
 void PaintPanel(HWND hwnd) {
@@ -767,7 +907,6 @@ void PaintPanel(HWND hwnd) {
     if (RectsOverlap(dirty, L.foot)) PaintFoot(dc);
     PaintToast(dc);
     PaintMenu(dc);
-    PaintModal(dc);
     LONGLONG t4 = g_perfOn ? PerfNow() : 0;
 
     // 外边框（1px 线压在窗口内侧，对齐像素中心才不会糊）
@@ -780,6 +919,7 @@ void PaintPanel(HWND hwnd) {
     }
 
     PaintHeadButtons(dc);      // 压在外框线之上，让按钮高亮贴住窗口边缘
+    PaintModal(dc);            // 确认卡片压在最上层（删单条就是从列表里点出来的）
 
     PaintEnd();
     LONGLONG t5 = g_perfOn ? PerfNow() : 0;

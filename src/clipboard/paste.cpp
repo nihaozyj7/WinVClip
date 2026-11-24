@@ -10,13 +10,30 @@
 #include <vector>
 
 #include "core/app_state.h"    // g_pasteTarget / g_targetFocus / g_injectMark
+#include "core/history_store.h" // EnsureItemText（长正文只在库里）
 #include "core/model.h"
 #include "core/text_util.h"
 #include "core/util.h"         // MarkMine
+#include "image/raster.h"      // EnsureItemBits（图片像素的临时副本）
 
 using namespace wv;
 
-void PutToClipboard(const ClipItem& it) {
+void PutToClipboard(const ClipItem& itIn) {
+    // 图片像素可能只躺在临时目录里（内存预算已释放），写剪贴板前先读回来；
+    // 文本正文同理：超过阈值的正文只在数据库里（见 core/history_store.h）。
+    ClipItem copy;
+    const ClipItem* use = &itIn;
+    if (itIn.kind == 2 && itIn.bits.empty()) {
+        copy = itIn;
+        if (!EnsureItemBits(copy)) return;
+        use = &copy;
+    } else if (itIn.kind == 0 && itIn.text.empty()) {
+        copy = itIn;
+        if (!EnsureItemText(copy)) return;   // 取不回来就别把空文本塞给目标窗口
+        use = &copy;
+    }
+    const ClipItem& it = *use;
+
     if (!OpenClipboard(g_main)) return;
     EmptyClipboard();
 

@@ -9,6 +9,7 @@ HHOOK  g_hook  = nullptr;
 HHOOK  g_mouseHook = nullptr;
 HWND   g_main  = nullptr;
 HWND   g_panel = nullptr;
+HWND   g_setWin = nullptr;
 HWND   g_target = nullptr;
 HWND   g_pasteTarget = nullptr;
 HWND   g_targetFocus = nullptr;
@@ -31,7 +32,9 @@ int    g_filter = FL_ALL;
 std::wstring g_query;
 std::wstring g_comp;
 std::vector<int> g_view;
-int    g_sel = 0, g_top = 0, g_hoverRow = -1, g_hoverChip = -1;
+int    g_sel = 0, g_hoverRow = -1, g_hoverChip = -1;
+int    g_top = 0, g_rowOff = 0;
+int    g_scrollY = 0, g_scrollTarget = 0;
 int    g_hoverCell = -1;
 int    g_emojiCat = 0, g_symCat = 0;
 
@@ -47,6 +50,9 @@ POINT  g_menuPt{0, 0};
 bool   g_dialogOpen = false;
 bool   g_modalOpen = false;
 int    g_modalRow = -1;
+int    g_modalKind = MODAL_DELETE_ONE;
+bool   g_settingsOpen = false;
+int    g_setHover = -1;
 
 // ---------------------------------------------------------------- 拖动 / 缩放
 bool   g_dragging = false;
@@ -55,6 +61,8 @@ RECT   g_dragRect{0, 0, 0, 0};
 int    g_resizing = 0;
 POINT  g_rsFrom{0, 0};
 RECT   g_rsRect{0, 0, 0, 0};
+bool   g_sbarDrag = false;
+int    g_sbarGrab = 0;
 
 bool   g_hideNoRestore = false;
 bool   g_pinned = false;
@@ -65,6 +73,7 @@ bool   g_inputMode = false;
 ClipBak g_clipBak;
 bool    g_borrowedClip = false;
 DWORD   g_selfClipSeq = 0;
+DWORD   g_delClipSeq = 0;
 
 // ---------------------------------------------------------------- 尺寸 / 定位
 int    g_panelW = 0, g_panelH = 0;

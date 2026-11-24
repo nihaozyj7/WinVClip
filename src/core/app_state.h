@@ -37,10 +37,16 @@
 // WM_APP 段的自定义消息与 SetTimer 的定时器 id。放在这里而不是 main.cpp，
 // 因为后台模块（emoji 图集、剪贴板采集）也要用它们排自己的重绘/延迟。
 enum { WM_APP_HOTKEY = WM_APP + 1, WM_APP_TRAY = WM_APP + 2, WM_APP_DEFER_HIDE = WM_APP + 10,
-       WM_APP_HIDE_OUTSIDE = WM_APP + 11 };
+       WM_APP_HIDE_OUTSIDE = WM_APP + 11, WM_APP_RECONCILE = WM_APP + 12 };
 enum { TIMER_CLIP = 0x101, TIMER_PASTE = 0x102, TIMER_TOAST = 0x103, TIMER_CARET = 0x104,
        TIMER_FOCUS = 0x106, TIMER_EMOJI = 0x107, TIMER_WARM = 0x108, TIMER_CLIPRESTORE = 0x109,
-       TIMER_REPROBE = 0x10A, TIMER_DEFERHIDE = 0x10B };
+       TIMER_REPROBE = 0x10A, TIMER_DEFERHIDE = 0x10B, TIMER_IDLE = 0x10C,
+       TIMER_PERSIST = 0x10D, TIMER_SCROLL = 0x10E };
+// 面板隐藏多久之后回收 D2D 设备与 emoji 图集。这两个东西是常驻内存的大头
+// （实测一套软件 D2D 设备 = 一块 25~32MB 的 PAGE_NOCACHE 私有池，图集 19.5MB），
+// 而程序绝大多数时间是隐藏的，留着它们纯属白占。90 秒是为了「连续使用」不付重建代价：
+// 复制→Win+V→选完→再复制 这种节奏永远落在窗口内，只有真的离开电脑才会回收。
+#define IDLE_RELEASE_MS 90000
 
 // ---------------------------------------------------------------- 页面 / 筛选
 enum { PG_HISTORY = 0, PG_FAV, PG_EMOJI, PG_SYMBOL, PG_COUNT };
@@ -52,6 +58,8 @@ extern HHOOK  g_hook;        // 低级键盘：Win+V 热键 + 面板按键转发
 extern HHOOK  g_mouseHook;   // 低级鼠标：点面板外部即收起
 extern HWND   g_main;
 extern HWND   g_panel;
+// 设置窗口（独立窗口，见 ui/settings_win.h）。关闭时被销毁，句柄置空。
+extern HWND   g_setWin;
 extern HWND   g_target;
 extern HWND   g_pasteTarget;
 // 唤起面板时，目标窗口内部那个有焦点的控件（地址栏的编辑框、搜索框…）。
@@ -94,7 +102,16 @@ extern int    g_filter;
 extern std::wstring g_query;
 extern std::wstring g_comp;      // IME 组合串（尚未上屏）：只用于显示与光标定位
 extern std::vector<int> g_view;
-extern int    g_sel, g_top, g_hoverRow, g_hoverChip;
+extern int    g_sel, g_hoverRow, g_hoverChip;
+// 列表滚动是像素级的，不是「整行索引」：早先只存 g_top（首行行号），滚轮一格
+// 就整行跳一次，观感像内容被成批换掉而不是在滚动。现在主状态是 g_scrollY
+// （相对列表内容顶部的像素偏移，0 = 首行贴顶），g_top / g_rowOff 由它派生：
+//   g_top    = g_scrollY / 行高     —— 首个（可能是部分）可见行的下标
+//   g_rowOff = g_scrollY % 行高     —— 该行被上移掉的像素
+// 只有 layout.cpp 的 SyncListScroll 能改这两个派生量，别处一律写 g_scrollY。
+extern int    g_top, g_rowOff;
+extern int    g_scrollY;       // 当前显示用的偏移（缓动中逐帧逼近目标）
+extern int    g_scrollTarget;  // 缓动目标
 extern int    g_hoverCell;
 // 0 = 「最近使用」，n≥1 对应 g_emoCats / g_symCats[n-1]
 extern int    g_emojiCat, g_symCat;
@@ -112,6 +129,16 @@ extern POINT  g_menuPt;        // 右键呼出菜单时的光标位置（客户�
 extern bool   g_dialogOpen;    // 文件对话框打开期间禁止「失焦即隐藏」
 extern bool   g_modalOpen;
 extern int    g_modalRow;
+// 确认卡片承载两类危险动作：同一张卡片、同一份几何（layout 的 ModalRect），
+// 文案与「确认之后执行什么」按这个种类分叉（见 actions.cpp 的 ConfirmDelete /
+// ConfirmClearHistory）。默认值要让「只设了 g_modalOpen 的老路径」仍然删单条。
+enum { MODAL_DELETE_ONE = 0, MODAL_CLEAR_HIST = 1 };
+extern int    g_modalKind;
+// 设置弹层（齿轮按钮）。和 g_modalOpen 是同级弹层：两者互斥，都是「盖住面板的卡片」。
+// g_setHover 存的是 layout.h 里 SET_* 编码的当前悬停控件，-1 = 无。
+// 现在是独立窗口（见 ui/settings_win.h）：g_settingsOpen = 真 ⇔ g_setWin 存在且可见。
+extern bool   g_settingsOpen;
+extern int    g_setHover;
 
 // ---------------------------------------------------------------- 拖动 / 缩放
 // 写者：panel.cpp（WM_LBUTTONDOWN + SetCapture，不用系统模态循环）
@@ -122,6 +149,11 @@ extern int    g_resizing;
 extern POINT  g_rsFrom;
 extern RECT   g_rsRect;
 enum { RS_NONE = 0, RS_L, RS_R, RS_T, RS_B, RS_TL, RS_TR, RS_BL, RS_BR };
+
+// 滚动条拖拽（写者：panel.cpp 的鼠标消息）。g_sbarGrab 是按下点相对滑块顶部的
+// 偏移：拖动时内容严格跟手，滑块不会「跳」到光标正中。
+extern bool   g_sbarDrag;
+extern int    g_sbarGrab;
 
 // 「点外面收起」这条路上不许抢前台：用户点的窗口正等着激活，HidePanel 若趁机
 // SetForegroundWindow(g_target) 就会把前台拽回去（前台锁会让用户那次点击落空）。
@@ -149,6 +181,11 @@ extern ClipBak g_clipBak;
 extern bool    g_borrowedClip;   // 正在借用中（备份已做、尚未还原）
 // 我方最后一次写剪贴板产生的序列号：既用于跳过「自己写的」捕获，也用于还原前的安全检查
 extern DWORD   g_selfClipSeq;
+// 用户删掉的那条正躺在剪贴板里时记下当时的序列号（写者：actions.cpp 的删除/清空）。
+// 唤出面板会补捕一次剪贴板（ShowPanel → CaptureClipboard），没有这道标记就会把
+// 刚删掉的内容重新捡回历史顶部，表现为「这一条怎么都删不掉」。剪贴板一变（seq 变了）
+// 标记自动失效：用户主动再复制同样的内容照样入历史。
+extern DWORD   g_delClipSeq;
 
 // ---------------------------------------------------------------- 尺寸 / 定位
 // 写者：panel.cpp。g_panelW/H 是本次显示的实际值，g_savedW/H 是上次调整后落盘的值

@@ -55,6 +55,8 @@ using namespace wv;
 #include "core/io_png.h"
 #include "core/model.h"
 #include "core/app_state.h"
+#include "core/settings.h"     // g_cfg / SettingsLoad / ApplyThemeFromSettings
+#include "core/history_store.h" // HistoryLoad / HistoryFlush（历史跨进程保留）
 #include "glyph/glyph.h"
 #include "core/text_measure.h"
 #include "core/util.h"
@@ -73,8 +75,10 @@ using namespace wv;
 #include "ui/showhide.h"
 #include "app/tray.h"
 #include "app/hook.h"
+#include "app/startup.h"     // IsProcessElevated / RelaunchElevated / SetAutostart
 #include "ui/panel.h"
 #include "ui/actions.h"
+#include "ui/settings_win.h"
 #include "model/clip_model.h"
 
 // ================================================================== 数据
@@ -98,6 +102,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_HOTKEY:
         if (IsWindowVisible(g_panel)) HidePanel();
         else ShowPanel();
+        return 0;
+
+    // 启动后异步对一次账：把 Run 项 / 计划任务对齐到「当前设置 + 当前权限」。
+    // 放消息里而不是 wWinMain 里，是为了不拖慢热键就绪（COM 查询任务计划要几十毫秒）。
+    case WM_APP_RECONCILE:
+        ReconcileAutostart();
         return 0;
 
     case WM_TIMER:
@@ -149,31 +159,67 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_CLIPRESTORE) {
             KillTimer(hwnd, TIMER_CLIPRESTORE);
             RestoreClipboard();
+        } else if (wp == TIMER_IDLE) {
+            // 闲置回收：面板还开着就作废这次（用户在用时绝不 trim）
+            KillTimer(hwnd, TIMER_IDLE);
+            if (!g_panel || !IsWindowVisible(g_panel)) {
+                ReleaseIdleMemory();
+                SetTimer(hwnd, TIMER_IDLE, IDLE_RELEASE_MS, nullptr);
+            }
+        } else if (wp == TIMER_PERSIST) {
+            // 防抖落盘：连续复制十几条只写一次盘（见 core/history_store.h）
+            KillTimer(hwnd, TIMER_PERSIST);
+            HistoryFlush();
         }
         return 0;
 
     case WM_CLIPBOARDUPDATE:
         OnClipboardChanged();
         return 0;
+
+    // 系统「应用模式」变了（浅色/暗色切换）。只有「跟随系统」才需要跟，
+    // 但这里不做额外判断之外的副作用：重刷一次调色板再重绘面板。
+    case WM_SETTINGCHANGE:
+        if (g_cfg.theme == THEME_SYSTEM) {
+            ApplyThemeFromSettings();
+            if (g_panel) Redraw();
+        }
+        return 0;
+
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_LBUTTONUP) {
             if (IsWindowVisible(g_panel)) HidePanel(); else ShowPanel();
         } else if (LOWORD(lp) == WM_RBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
             HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, 1, L"打开面板");
+            // 三个入口：打开剪贴板（= Win+V 的等效项）/ 设置（独立窗口）/ 退出。
+            // 托盘是唯一不依赖热键的入口，所以「设置」必须在这里——否则热键失灵时
+            // 用户连设置都打不开（比如管理员模式导致低权限窗口收不到 Win+V）。
+            AppendMenuW(m, MF_STRING, 1, L"打开剪贴板");
+            AppendMenuW(m, MF_STRING, 2, L"设置");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 2, L"退出");
+            AppendMenuW(m, MF_STRING, 3, L"退出");
             SetForegroundWindow(hwnd);
             int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                           pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(m);
-            if (cmd == 1) ShowPanel();
-            else if (cmd == 2) DestroyWindow(hwnd);
+            if (cmd == 1) {
+                ShowPanel();
+            } else if (cmd == 2) {
+                OpenSettings();
+            } else if (cmd == 3) {
+                LogEvent(L"exit: 托盘菜单「退出」");
+                DestroyWindow(hwnd);
+            }
         }
         return 0;
 
     case WM_DESTROY:
+        // 退出前把历史写下去。这里是所有 DestroyWindow 路径（托盘「退出」、
+        // 开管理员模式后的提权重启）的共同出口，比在每个调用点各写一次可靠。
+        HistoryFlush();
+        // 设置是独立顶层窗口，不会跟着主窗口一起消失，必须显式销毁
+        if (g_setWin) { DestroyWindow(g_setWin); g_setWin = nullptr; }
         RemoveTray();
         PostQuitMessage(0);
         return 0;
@@ -197,8 +243,58 @@ static void InitData() {
 
 // ================================================================== 入口
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"WinVClip_SingleInstance");
-    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    // --elevated：上一次运行的自己（普通权限）为了让「管理员模式」生效，用 runas
+    // 把这一份拉起来了。两个含义见下面两处用法。
+    bool relaunched = (cmdLine && wcsstr(cmdLine, L"--elevated"));
+
+    SettingsLoad();
+    ApplyThemeFromSettings();
+    LogLaunch();   // 「开机自启没生效」的排查凭据：这一行证明进程到底有没有被拉起
+
+    // 管理员模式：设置里开着、当前权限却不够，就提权重启，本进程立刻退出。
+    // 低权限下按 Win+V，任务管理器/注册表编辑器这类高权限窗口收不到焦点，
+    // 表现就是「热键失灵」——这是这个设置项存在的理由。
+    if (g_cfg.admin && !IsProcessElevated()) {
+        if (RelaunchElevated()) return 0;
+        // 用户在 UAC 上点了「否」：降级继续跑，并记下来，别每次启动都弹一次 UAC
+        g_cfg.admin = false;
+        SettingsSave();
+    }
+    // 自启形式的对齐（Run 项 ↔ 计划任务）交给 ReconcileAutostart：它看的是
+    // 「当前设置 + 当前权限」，所以开/关管理员模式后重启程序会自动换过来。
+    // 入口在消息循环里（WM_APP_RECONCILE），这里不阻塞。
+
+    // 单实例：命名互斥量，存在即视为「已经有实例在跑」。
+    // 拿不到锁本身不是错误（用户双击了两次，或者 UAC 提权的那一份先起来了），
+    // 但不能静默消失——要把已经在跑的那一份唤出来，并留一行日志说明是谁赢了。
+    HANDLE mtx = nullptr;
+    const int tries = relaunched ? 40 : 1;   // 提权重启的那一份要等旧实例放锁
+    for (int i = 0; i < tries; ++i) {
+        HANDLE m = CreateMutexW(nullptr, TRUE, L"WinVClip_SingleInstance");
+        bool exists = (GetLastError() == ERROR_ALREADY_EXISTS);
+        if (m && !exists) { mtx = m; break; }
+        if (m) CloseHandle(m);
+        if (i + 1 < tries) Sleep(50);
+    }
+    if (!mtx) {
+        // 已有实例在跑：把自己要做的事交给它，让面板弹出来，
+        // 用户看到的就不是「双击了程序却什么也没发生」。
+        HWND other = FindWindowW(MAIN_CLASS, nullptr);
+        if (other) {
+            DWORD opid = 0;
+            GetWindowThreadProcessId(other, &opid);
+            PostMessageW(other, WM_APP_HOTKEY, 0, 0);
+            LogEvent(L"singleton: 已有实例 pid=" + std::to_wstring(opid) +
+                     L"，已请求它唤出面板，本次退出");
+        } else if (relaunched) {
+            LogEvent(L"singleton: 提权重启后等旧实例放锁超时（2s），本次退出");
+        } else {
+            // 低权限进程看不到高权限实例的窗口（UIPI 按完整性级别过滤窗口枚举），
+            // 唤不出来，只能留痕——日志里能看出「不是没启动，是被已有实例挡住了」。
+            LogEvent(L"singleton: 已有实例在跑，但本进程看不到它的窗口（权限不同），本次退出");
+        }
+        return 0;
+    }
 
     SetProcessDPIAware();
     PerfInit();
@@ -209,8 +305,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     }
     g_ref = GetDC(nullptr);
     g_cfPng = RegisterClipboardFormatW(L"PNG");
+    TempClearImages();    // 清掉 <临时目录>\img 里旧版本留下的像素副本（历史图片现在在
+                          // <临时目录>\history\img，不受影响，见 core/history_store.h）
     LoadViewSize();       // 上次调整好的面板尺寸
+    HistoryLoad();        // 上一个会话的历史 + 最近使用的字形
     InitData();
+    ApplyHistoryLimit();  // 读过设置之后再按当前上限裁一次
+    BuildView();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     InitD2D();
     MakeFonts();          // 必须在 InitD2D 之后：字体要同时注册到 DirectWrite
@@ -235,9 +336,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     wc.style = CS_DROPSHADOW;
     RegisterClassExW(&wc);
 
+    RegisterSettingsClass(hInst);   // 设置窗口（普通可激活窗口，见 ui/settings_win.h）
+
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, MAIN_CLASS, L"WinVClip", WS_POPUP, 0, 0, 0, 0,
                              nullptr, nullptr, hInst, nullptr);
     if (!g_main) return 1;
+    // 放行另一个实例（可能是低权限的）发来的「唤出面板」：单实例被挡时它靠这条消息
+    // 把「双击了没反应」变成「面板弹出来」（见上面单实例那一段）。
+    ChangeWindowMessageFilterEx(g_main, WM_APP_HOTKEY, MSGFLT_ALLOW, nullptr);
 
     // WS_EX_NOACTIVATE 是「不抢焦点」方案的地基：面板从不夺取前台，
     // 目标窗口的键盘焦点和文本插入符因此一直保留，光标照常闪烁。
@@ -259,7 +365,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
 
     AddTray();
     SetTimer(g_main, TIMER_WARM, 120, nullptr);   // 启动后就把字形图集准备好
+    // 启动即开始在跑字覆盖度/图集预热，那段跑完后如果一直没人唤出面板，
+    // 也该把工作集让出去——所以闲置计时从启动就算起（HidePanel 会重置它）
+    SetTimer(g_main, TIMER_IDLE, IDLE_RELEASE_MS, nullptr);
     PostMessageW(g_main, WM_CLIPBOARDUPDATE, 0, 0);
+    PostMessageW(g_main, WM_APP_RECONCILE, 0, 0);   // 启动后把自启登记对一次账
 
     if (cmdLine && wcsstr(cmdLine, L"--show")) {
         PostMessageW(g_main, WM_APP_HOTKEY, 0, 0);
@@ -271,6 +381,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
         DispatchMessageW(&msg);
     }
 
+    // 退出留痕：下次若又看到进程还在，就能分清「根本没走到这里」（退出路径卡住）
+    // 和「退出后又被别的什么东西拉起来了」（日志里会出现新的 pid 启动行）。
+    LogEvent(L"exit: 消息循环结束，正在清理退出");
     StopEmojiWorker();        // 工作线程必须在 D2D/atlas 释放之前停掉
     ReleaseEmojiCache();
     UnhookWindowsHookEx(g_hook);

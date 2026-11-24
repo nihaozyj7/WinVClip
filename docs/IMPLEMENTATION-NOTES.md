@@ -384,6 +384,27 @@ GDI 只负责最后 `BitBlt` 到窗口，画面全部画在 Direct2D + DirectWri
   校正滚动位置——列表行数跟着高度走，`Layout::row` 是 `std::vector`（早期固定 14 行，拉高就溢出）。
 - 最小尺寸 `360×340` = 「四页签 + 三按钮排得开」与「至少露出两行」的交集。宽度下限压到 360 后四页签的
   自然宽度放不下，`ComputeLayout` 按可用宽度**均分**页签，底部提示条「装不下的项直接不画」，右侧计数优先保留。
+
+### 8.1.1 列表滚动：行高固定 + 像素偏移 + 缓动
+
+- **行高恒为 `ROW_H`（56），不拉伸**。曾经试过「列表填满可视区时把不足一行的余数摊给各行」来消灭底部
+  空档，结果更糟：那几十像素的留白本来就在暗示「下面还有内容」，摊平之后行高变得不整齐，观感反而像到了底。
+  正确做法是**照常画出底部那半行**，让下边沿把它切掉——`L.nRow` 因此可能多算一行，`PaintRow` 拿到的是完整
+  行矩形（会越出 `body` 上下沿），裁切交给 `PaintPanel` 已有的 `PushAxisAlignedClip(body)`。
+  命中判定同样依赖这点：先 `PtIn(L.body, p)` 再遍历 `L.row`，点到越界的那半行就等于点到它所属的那一行。
+- **滚动状态只有一个**：`g_scrollY`（相对内容顶部的像素）。`g_top = g_scrollY / 行高`、
+  `g_rowOff = g_scrollY % 行高` 是派生量，只由 `SyncListScroll()` 写——早先 `g_top` 是主状态，
+  滚轮一格是 `g_top++`，内容一帧整行跳一次，观感是「一批格子换成另一批」，用户直接点出「完全没有滚动」。
+- **坑：改了 `g_scrollY` 必须重算布局**。行矩形是 `ComputeLayout` 按 `g_rowOff` 生成的，只改偏移不重算，
+  绘制仍用旧矩形 → 滚轮"完全没反应"且不报错。`TickListScroll()` 末尾因此带一次 `ComputeLayout()`。
+- **缓动**：滚轮只改 `g_scrollTarget` 并起 `TIMER_SCROLL`（16ms），每帧把剩余行程走一半（约 5 帧 / 80ms 到位）。
+  一格滚轮 = 一行高，`-delta * 行高 / WHEEL_DELTA` 保证触控板的零碎 delta 按比例滚，是真正的逐像素滚动。
+  连滚时从**目标**累加而不是当前位置，否则上一格没走完的行程会被吃掉，手感比手慢半拍。
+- 键盘导航（↑↓/PgUp/PgDn）、重置、`WM_SIZE` 一律**即时到位**（`ClampScroll` 里 `g_scrollY = g_scrollTarget = y`
+  并 `KillTimer`）：这些场景要的是「准确」而不是「顺滑」，带惯性会出现连按 ↓ 时视口一直在追。
+- 滚动条用 `g_scrollY` 而不是 `g_top * 行高`：后者只能整行对齐，滚到一半时滑块不动。
+- 回归用例 `tests/test_scroll.py`（util 归一，见该文件头部的四条坑：滚轮正 delta 是向上、要按
+  `GetClipboardSequenceNumber` 判「粘没粘上」、粘贴会把条目移到顶部所以不能跨步比较内容、面板收起会重置滚动）。
 - **尺寸记忆**：松手时写 `%LOCALAPPDATA%\WinVClip\view-size.txt`（一行「宽 高」），启动时 `LoadViewSize`
   读回，`ShowPanel` 再用并夹一次最小尺寸与当前工作区。删掉该文件回到默认 `560×620`。
 
@@ -501,10 +522,14 @@ I\t<字形>\t<中文名>[\t<英文名>]\n  条目
 1. **磁盘持久化图集**：全部 emoji 渲染成一张 atlas 落在
    `%LOCALAPPDATA%\WinVClip\emoji-atlas-v2-<sz>px-<cols>.bin`（约 19MB），下次启动只读文件 + 逐格
    `CopyFromMemory`，一个字形都不用光栅化。
-2. **后台全量预热**：首次运行（无缓存）时 2 个 worker 把 1923 个 emoji 渲一遍，全进 atlas 后一次写盘；
-   启动 120ms 后自动开始（`TIMER_WARM`），实测 1~3 秒。
+2. **后台全量预热**：首次运行（无缓存）时把 1923 个 emoji 渲一遍，全进 atlas 后一次写盘；
+   启动 120ms 后自动开始（`TIMER_WARM`），实测 1~3 秒。只开 1 个 worker——每多一个就要多一套
+   D2D 设备（25~32MB，见 9.8），而磁盘缓存命中后这一步根本不会跑。
 3. **视口优先队列**：UI 请求（可见格/预取行）永远排在预热任务之前——worker 先取 `g_emoReq`（LIFO），
    空了才推进 `g_emoWarmJobs`，所以切分类、滚动任何时刻都是即时的。
+4. **worker 按需拉起**（见 9.9）：干完活的 worker 会自行退出以归还那套 D2D/DWrite 设备，
+   所以 `PrepareEmojiBitmaps` 里只能「有缺失格时才 `EnsureEmojiWorker`」——无条件拉 =
+   每帧「刚停又建」，一台设备几十毫秒。
 
 atlas 容量按「全部 emoji 条数 + 8%」定（`cols = ceil(sqrt(1936)) = 46`，46×46 = 2116 格，2208×2208 px），
 **装得下就不淘汰**。早期 400 格 + LRU 淘汰的问题正是「切回旧分类要重新光栅化」。
@@ -532,6 +557,70 @@ atlas 容量按「全部 emoji 条数 + 8%」定（`cols = ceil(sqrt(1936)) = 46
   软件 DCRenderTarget 上这个 API 对超大区域不可信，别用。
 - **写盘内容必须自己验**：`tools/inspect_cache.py` 直接解析缓存文件、把前几格导成 PNG，才能区分「写盘错」
   还是「加载/绘制错」。
+
+### 9.8 常驻内存：为什么是 100+MB，以及怎么压下去
+
+`vmmap <pid>`（`tools/vmmap.c`）把提交内存按类型列出来才看清真相：**每一套 D2D 软件设备独占一块
+25~32MB 的 `PAGE_NOCACHE` 私有池**。原来 UI 线程 + 2 个 emoji worker 各自 `D2D1CreateFactory`，
+三套 = 96MB，这才是「一个剪贴板工具占一百多 MB」的全部原因。隔离实验（最小复现，逐项加）：
+
+| 步骤 | 工作集 | 私有提交 |
+|---|---|---|
+| 空进程 | 8.5MB | 1.2MB |
+| + D2D 工厂 & DCRenderTarget & 首次 BeginDraw | 44.5MB | 26.4MB |
+| 同一工厂里再建 2 个 DCRenderTarget | +0.1MB | +0.1MB |
+| **各自独立的工厂**再建 2 个 | +27MB | +32MB |
+
+结论：池是「每个工厂（设备）一份」，不是每个 target 一份；只放 target 不还，工厂一起放才还。
+字体/DWrite 不是大头（<1MB）。
+
+三条对应的改法（都在 9.5 那张图集架构内）：
+
+1. **worker 只留 1 个**，并且**活干完就停**（`PumpEmojiUploads` 末尾 `StopEmojiWorker`）——
+   设备连同它缓存的字形一起还给系统，下次要新字形时由 `EnsureEmojiWorker` 现拉起来（~60ms，一次性）。
+   日常切分类全是磁盘缓存命中，根本不进光栅化，所以不会有感。
+2. **预热镜像用 `VirtualAlloc/VirtualFree`**：19.5MB 的 `vector` 即使 `clear + shrink_to_fit`，
+   CRT 也常把页留在提交里；这里是一次性大块，直接走虚拟内存 API 才能真回收。
+3. **闲置回收只 trim 工作集，不释放 D2D 设备**：`SetProcessWorkingSetSize(-1,-1)` 让私有页进 standby，
+   任务管理器里那一列（= 工作集）直接掉到 1MB 以下，物理内存真的还给了系统；而对象还在，
+   唤出不用重建。实测唤出延迟：热态中位 7.7ms、trim 后 7.3ms——**trim 不影响响应**。
+   反过来若为了省提交去释放 D2D 设备，唤出要付 60ms 重建，那是砍在热路径上，不能做。
+4. 图集在连续闲置 30 分钟后才放（`ReleaseEmojiCache`，磁盘缓存保留），因为重新读盘 ~200ms，
+   只在「离开电脑很久之后」才会发生。
+
+改完的实测：**隐藏闲置 0.2~0.5MB 工作集**（原 111.8MB），唤出后历史页 ~45MB、表情页 ~67MB（含 19.5MB 图集），
+冷启动峰值从 192MB 降到 ~90MB。顺手修的两处：图片历史加 32MB 总量预算（`TrimImageBudget`，
+单条 CF_DIB 上限 128MB × 60 条是潜在的 GB 级膨胀）；图片去重先比 size+hash 再 memcmp
+（同分辨率截图的 DIB 大小完全一样，原来每次复制要逐字节比几十 MB × 最多 60 条）。
+
+---
+
+### 9.9 「每帧停一次再建一次 worker」：表情页滚动卡顿的真正原因
+
+`PumpEmojiUploads` 末尾「活干完就 `StopEmojiWorker`」本身是对的（归还 25~32MB 设备，见 9.8），
+但它和 `PrepareEmojiBitmaps` 里**无条件**的 `EnsureEmojiWorker()` 撞在一起就成了灾难：
+
+- 每画一帧 → 上传队列空 → 停 worker（join + 释放设备/工厂/位图）→ 紧接着又拉起来
+  （新建 D2D 工厂 + DCRenderTarget + DIB + DWrite 工厂 + 44px TextFormat）。
+- 实测（`--perf`，560×620）：表情页滚动 `prep` 段 **35~53ms/帧**、`total` 36~53ms；
+  另用「PostMessage(滚轮) 之后 SendMessage(WM_NULL) 的往返」量 UI 线程延迟，中位 **24ms**。
+- 这个延迟之所以会让**整个系统的鼠标**都发钝：低级鼠标钩子（`WH_MOUSE_LL`）的回调排在装钩子的
+  线程（我们的 UI 线程）上，线程一帧被占几十毫秒，全系统的鼠标事件都跟着排队。
+
+改法：先算「可见格 + 上下各一行预取里有没有缺格」，**有才** `EnsureEmojiWorker()`；
+热缓存、没有缺失格时一次设备都不建。同场景复测：`prep` 0.45ms、`total` 1.5~2.0ms、
+线程往返中位 0.2ms（历史页 1.7~2.3ms、符号页 1.9~2.0ms，三页齐平）。
+
+同批修掉的两条「只有一半动了」类问题（`tools/measure_grid.py` 可复测，回归见
+`tests/test_glyph_scroll.py`）：
+
+- **网格页的滚动条几何**：滑块位置在 `ComputeScrollbar`（挂在 `ComputeLayout` 里）算。表情/符号页
+  滚轮只改 `g_gridScroll` 却不重算布局时，视图会滚、滑块钉在原地——用户侧原话是
+  「滚动条用滚轮时无响应，但视图确实在滚动」。
+- **网格页也走缓动**：一格滚轮 52px 一帧跳完 = 一整排格子瞬间换掉。现在与列表共用同一份
+  smoothstep 曲线和 16ms 定时器（`TickListScroll` 按 `g_animGrid` 分流到 `g_gridScroll`），
+  动画自己记住「上次写到哪」（`g_gridAnchor`），别处直接改偏移（切分类 / 改尺寸 / 拖滑块）
+  时它自动让位，不会把新位置按旧行程拽回去。
 
 ---
 

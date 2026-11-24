@@ -51,6 +51,7 @@ wchar_t VkToChar(DWORD vk, DWORD scan) {
 // 点过搜索框的输入态可用）。
 bool PanelConsumesBareKey(DWORD vk, wchar_t ch) {
     if (vk == VK_ESCAPE) return true;
+    if (g_settingsOpen) return false;      // 设置窗口开着时，键该留给它/前台程序
     if (vk == VK_TAB)    return true;
     if (g_modalOpen || g_menuOpen)
         return vk == VK_RETURN || vk == VK_UP || vk == VK_DOWN;

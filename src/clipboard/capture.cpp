@@ -5,8 +5,10 @@
 #include <vector>
 
 #include "core/app_state.h"    // g_main / g_items / g_panel
+#include "core/history_store.h" // StoreImageCopy / HistoryTouch（历史跨进程保留）
 #include "core/io_png.h"       // Rgba
 #include "core/model.h"        // ClipItem
+#include "core/settings.h"     // g_cfg / HIST_MIN
 #include "core/text_util.h"
 #include "core/theme.h"
 #include "core/util.h"         // Utf8Bytes / SizeText / FileBase / PathBytes
@@ -45,13 +47,124 @@ std::wstring ForegroundSource() {
     return s;
 }
 
+// 图片条目的内存预算。
+// ClipItem::bits 存的是原始数据（浏览器复制图片是 PNG，截图工具/Office 常给 CF_DIB，
+// 未压缩的 DIB 一条 4K 就是 33MB）。像素会先落一份到 <临时目录>\history\img
+// （见 core/history_store.h），内存里只留最近几张（见 TrimImageBits），所以不再需要
+// 「按容量丢条目」这种牺牲历史的做法：内容在磁盘上，需要时用 EnsureItemBits 读回来。
+static const size_t IMG_MEM_BUDGET = 32u * 1024 * 1024;
+static const int    IMG_KEEP = 4;          // 无论预算如何，最近这 4 张的像素留在内存里
+
+// 内容哈希（FNV-1a）：只为了给去重做粗筛，真判等仍靠 memcmp
+static size_t HashBits(const std::vector<BYTE>& b) {
+    size_t h = 1469598103934665603ull;
+    for (BYTE c : b) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+// 像素副本落进 <临时目录>\history\img（见 core/history_store.h）。它既是「内存预算
+// 释放后还能读回来」的来源，也是「重启后这条图片还在」的唯一内容来源。
+// 失败返回空：那一张退化成只活在内存里，功能不受影响，只是重建缩略图要重新解码。
+static std::wstring SaveTempImageCopy(const std::vector<BYTE>& bits) {
+    return StoreImageCopy(bits);
+}
+
+void DropItemTemp(const ClipItem& it) {
+    if (!it.diskPath.empty()) DeleteFileW(it.diskPath.c_str());
+}
+
+// 剪贴板里现在装的是不是这一条。只比文本与文件列表：
+//   · 图片条目从剪贴板里删掉之后再去唤出面板的情形几乎不存在，而且比像素要把
+//     CF_DIB 再解一遍，代价与收益不成比例；
+//   · 正文可能只存在库里（见 history_store.h 的内存策略），所以调用方要先
+//     EnsureItemText，取不回来时 text 为空——这时一律当作「不是同一条」，
+//     宁可多冒一次「删掉的条目被捡回来」的风险，也不要把无关内容错当成它。
+bool ClipboardHoldsItem(const ClipItem& it) {
+    if (it.kind != 0 && it.kind != 1) return false;
+    if (it.kind == 0 && it.text.empty()) return false;
+    if (!OpenClipboard(g_main)) return false;
+    bool same = false;
+    if (it.kind == 0) {
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+            if (auto* p = (const wchar_t*)GlobalLock(h)) {
+                same = (it.text == p);
+                GlobalUnlock(h);
+            }
+        }
+    } else if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        auto drop = (HDROP)h;
+        UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        if (n == it.files.size()) {
+            same = true;
+            for (UINT i = 0; i < n && same; ++i) {
+                UINT len = DragQueryFileW(drop, i, nullptr, 0);
+                std::wstring s(len + 1, L'\0');
+                DragQueryFileW(drop, i, &s[0], len + 1);
+                s.resize(len);
+                if (s != it.files[i]) same = false;
+            }
+        }
+    }
+    CloseClipboard();
+    return same;
+}
+
+// 释放超出预算的像素（从最新的往后数，最近的保留）。有磁盘副本才敢丢内存。
+static void TrimImageBits() {
+    size_t total = 0;
+    int n = 0;
+    for (auto& it : g_items) {
+        if (it.kind != 2 || it.bits.empty() || it.diskPath.empty()) continue;
+        ++n;
+        total += it.bits.size();
+        if (n > IMG_KEEP || total > IMG_MEM_BUDGET) {
+            total -= it.bits.size();
+            std::vector<BYTE>().swap(it.bits);
+        }
+    }
+}
+
+void ApplyHistoryLimit() {
+    int lim = g_cfg.historyLimit;
+    if (lim < HIST_MIN) lim = HIST_MIN;
+    if (lim > HIST_MAX) lim = HIST_MAX;
+
+    // 上限只约束「普通历史」：置顶与收藏不占名额，也不会被裁掉——它们是用户显式
+    // 标记过的数据，和历史不是同一条线（清空历史同理，见 actions.cpp 的
+    // ClearHistoryKeepPinnedFav；载入时也必须把它们全取回来，见 HistoryLoad）。
+    // g_items 是「最新在前」，所以正向数够 lim 条普通条目之后，剩下的都是更旧的。
+    int normal = 0;
+    for (const auto& it : g_items) if (!it.pinned && !it.fav) ++normal;
+    if (normal > lim) {
+        std::deque<ClipItem> keep;
+        int kept = 0;
+        for (auto& it : g_items) {
+            if (it.pinned || it.fav) { keep.push_back(std::move(it)); continue; }
+            if (kept < lim) { ++kept; keep.push_back(std::move(it)); continue; }
+            DropItemTemp(it);
+        }
+        g_items.swap(keep);
+    }
+    TrimImageBits();
+}
+
+// 与已有文本条目比较正文。已有条目的超长正文可能只在数据库里（见 core/history_store.h
+// 的内存策略），先取回来再比；取不回来就当作不同——宁可多出一条历史，
+// 也不要把用户的记录误去重掉。
+static bool SameText(const ClipItem& old, const std::wstring& text) {
+    if (!old.text.empty()) return old.text == text;
+    ClipItem tmp = old;
+    return EnsureItemText(tmp) && tmp.text == text;
+}
+
 void CaptureClipboard() {
+    DWORD seq = GetClipboardSequenceNumber();
     // 自己写进去的内容（借用剪贴板粘贴表情/符号、或还原备份）不进历史，
     // 否则每点一个表情，历史里就多一条孤零零的 emoji。
-    {
-        DWORD seq = GetClipboardSequenceNumber();
-        if (g_selfClipSeq && seq == g_selfClipSeq) return;
-    }
+    if (g_selfClipSeq && seq == g_selfClipSeq) return;
+    // 用户刚删掉的那条正躺在剪贴板里（见 app_state.h 的 g_delClipSeq）：
+    // 唤出面板时这次补捕必须跳过它，否则删掉的内容立刻被捡回来。
+    if (g_delClipSeq && seq == g_delClipSeq) return;
     if (!OpenClipboard(g_main)) { SetTimer(g_main, TIMER_CLIP, 160, nullptr); return; }
 
     ClipItem it;
@@ -110,6 +223,7 @@ void CaptureClipboard() {
         for (auto& f : it.files) it.bytes += PathBytes(f);
     } else {
         it.bytes = it.bits.size();
+        it.hash = HashBits(it.bits);
     }
 
     if (it.text.empty() && it.files.empty() && it.kind != 2) return;
@@ -145,27 +259,39 @@ void CaptureClipboard() {
         it.tag = L"图片";
     }
 
-    // 去重
+    // 去重（图片先比 size+hash，只有两者都相同才做全量 memcmp）
+    auto sameBits = [](const ClipItem& a, const ClipItem& b) {
+        return a.isPng == b.isPng && a.bits.size() == b.bits.size() && a.hash == b.hash &&
+               SameBits(a.bits, b.bits);
+    };
     if (!g_items.empty()) {
-        const ClipItem& f = g_items.front();
+        ClipItem& f = g_items.front();
         bool same = (f.kind == it.kind);
         if (same) {
-            if (it.kind == 0) same = (f.text == it.text);
+            if (it.kind == 0) same = SameText(f, it.text);
             else if (it.kind == 1) same = (f.files == it.files);
-            else same = (f.isPng == it.isPng && SameBits(f.bits, it.bits));
+            else same = EnsureItemBits(f) && sameBits(f, it);
         }
         if (same) return;
         for (size_t i = 1; i < g_items.size(); ++i) {
             ClipItem& o = g_items[i];
             bool dup = (o.kind == it.kind);
             if (dup) {
-                if (it.kind == 0) dup = (o.text == it.text);
+                if (it.kind == 0) dup = SameText(o, it.text);
                 else if (it.kind == 1) dup = (o.files == it.files);
-                else dup = (o.isPng == it.isPng && SameBits(o.bits, it.bits));
+                else dup = EnsureItemBits(o) && sameBits(o, it);
             }
-            if (dup) { g_items.erase(g_items.begin() + i); break; }
+            if (dup) {
+                DropItemTemp(o);      // 旧的副本文件先删，别留成垃圾
+                g_items.erase(g_items.begin() + (ptrdiff_t)i);
+                break;
+            }
         }
     }
+    // 像素副本落盘放在去重之后：去重提前返回时不会留下没人引用的文件
+    if (it.kind == 2 && !it.bits.empty()) it.diskPath = SaveTempImageCopy(it.bits);
+
     g_items.push_front(std::move(it));
-    while (g_items.size() > 60) g_items.pop_back();
+    ApplyHistoryLimit();      // 历史上限 + 图片像素的内存预算（见 settings.h）
+    HistoryTouch();           // 新条目排一次防抖落盘
 }

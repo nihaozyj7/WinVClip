@@ -746,6 +746,101 @@ def report(exit_code=1):
     return 0
 
 
+# --------------------------------------------------------------------------
+# 面板布局复算（S() 缩放 + 设置卡片 / 确认卡片的几何）
+# 自绘界面没有可查询的控件树，坐标只能两边各算一遍：这里的数字必须与
+# src/ui/layout.cpp 的 ComputeSettings / ModalRect 保持一致。
+# --------------------------------------------------------------------------
+_bind(u.GetDpiForWindow, wintypes.UINT, HWND)
+
+
+def scale_dpi(hwnd):
+    """面板当前的 DPI（即源码里 S(v) = MulDiv(v, dpi, 96) 的那个 dpi）。"""
+    try:
+        d = u.GetDpiForWindow(hwnd)
+    except Exception:
+        d = 0
+    return d or 96
+
+
+def S(v, dpi=96):
+    """逻辑像素 -> 物理像素，与 core/util.h 的 S() 同一算法（MulDiv 四舍五入）。"""
+    return (int(v) * int(dpi) + 48) // 96
+
+
+SET_ROW_HEIGHTS = [52, 52, 56, 64, 52, 52, 62]   # SET_ROW_* 的自然高度
+
+
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_bind(shell32.IsUserAnAdmin, wintypes.BOOL)
+
+
+def is_elevated():
+    """当前 python 进程是否有管理员权限。
+
+    决定 SendInput 会不会被 UIPI 挡：提权的程序面板只收得下同权限进程的输入，
+    测试脚本若跑在普通权限下，Win+V 根本到不了面板（这类假失败要先看这一项）。
+    """
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def settings_geom(hwnd):
+    """面板上的齿轮按钮中心（客户区坐标）。
+
+    设置本身是独立窗口（类名 WinVClipSettings），它的几何见 settings_win_geom——
+    2026 年起设置不再是「盖在面板上的卡片」，别再按面板尺寸复算行位置。
+    """
+    dpi = scale_dpi(hwnd)
+    W, _ = size(hwnd)
+    btn = S(34, dpi)                    # HEAD_H：右上三个按钮是 HEAD_H 见方
+    return {"gear": (W - btn * 3 // 2, btn // 2)}
+
+
+def settings_win(timeout=3.0):
+    """等并返回设置窗口（独立窗口）。没打开时返回 None。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        hs = find_class("WinVClipSettings", visible_only=False)
+        if hs:
+            return hs[0] if isinstance(hs, list) else hs
+        time.sleep(0.05)
+    return None
+
+
+def settings_win_geom(sw):
+    """设置窗口客户区里的行几何：卡片 = 整个客户区，无居中、无压缩。"""
+    dpi = scale_dpi(sw)
+    _, _, cw, ch = client_origin(sw)
+    rows, top = [], S(48, dpi)          # headH = 48
+    for v in SET_ROW_HEIGHTS:
+        rows.append((top, top + S(v, dpi)))
+        top += S(v, dpi)
+    return {"w": cw, "h": ch, "x": 0, "y": 0, "rows": rows}
+
+
+def modal_ok_point(hwnd, clear=False):
+    """确认卡片上「确认」按钮的中心。
+
+    卡片在**它所在的窗口客户区**里居中：面板里的删除确认用它、设置窗口里的
+    清空确认也用它（两者客户区不同，所以必须传对应窗口的 hwnd）。
+    """
+    dpi = scale_dpi(hwnd)
+
+    def s(v):
+        return S(v, dpi)
+
+    _, _, W, H = client_origin(hwnd)
+    mw = s(300)
+    mh = s(178) if clear else s(146)
+    mx, my = (W - mw) // 2, (H - mh) // 2
+    bw = (mw - s(40) - s(8)) // 2
+    by = my + mh - s(20) - s(38)
+    return (mx + s(20) + bw // 2, by + s(38) // 2)
+
+
 __all__ = [
     # 环境
     "ROOT", "BUILD_EXE", "u", "U", "k32", "k", "WT", "os", "sys", "time",
@@ -771,6 +866,9 @@ __all__ = [
     "caret_of", "text_of", "edit_of", "edit_text", "focus_of",
     # 进程
     "exe_path", "start_notepad", "kill", "require_build",
+    # 布局复算
+    "scale_dpi", "S", "settings_geom", "settings_win", "settings_win_geom",
+    "modal_ok_point", "SET_ROW_HEIGHTS", "is_elevated",
     # 断言
     "section", "chk", "need", "report",
 ]

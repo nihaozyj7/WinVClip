@@ -20,20 +20,34 @@ namespace wv {
 // ---------------------------------------------------------------- 窗口类名
 inline const wchar_t* const MAIN_CLASS  = L"WinVClipMain";
 inline const wchar_t* const PANEL_CLASS = L"WinVClipPanelUI";
+// 设置窗口。独立成一个普通窗口（可激活），标题栏自绘（无系统边框，拖动由窗口过程
+// 自己算差值），与「非激活面板」仍是两套完全不同的交互模型，别混用。
+inline const wchar_t* const SETTINGS_CLASS = L"WinVClipSettings";
 
 // ---------------------------------------------------------------- 主题色
 // 原设计稿是 CSS 变量，这里一一对应，注释里保留变量名便于对照。
-inline constexpr COLORREF C_CANVAS   = RGB(244, 242, 237);   // --canvas  #F4F2ED
-inline constexpr COLORREF C_SURFACE  = RGB(255, 253, 248);   // --surface #FFFDF8
-inline constexpr COLORREF C_SUBTLE   = RGB(231, 227, 219);   // --subtle  #E7E3DB
-inline constexpr COLORREF C_INK      = RGB(32, 37, 43);      // --ink     #20252B
-inline constexpr COLORREF C_MUTED    = RGB(116, 122, 125);   // --muted   #747A7D
-inline constexpr COLORREF C_LINE     = RGB(213, 208, 200);   // --line    #D5D0C8
-inline constexpr COLORREF C_VOLT     = RGB(255, 107, 53);    // --voltage #FF6B35
-inline constexpr COLORREF C_VOLTSOFT = RGB(255, 224, 210);   // --voltage-soft #FFE0D2
-inline constexpr COLORREF C_SUCCESS  = RGB(47, 155, 104);    // --success #2F9B68
-inline constexpr COLORREF C_DANGER   = RGB(216, 58, 58);     // --danger  #D83A3A
-inline constexpr COLORREF C_RINGSOFT = RGB(255, 232, 221);   // 焦点光晕 rgba(255,107,53,.14)
+//
+// 这些值不再是 constexpr：设置里可以切「浅色 / 暗色 / 跟随系统」，而绘制代码
+// 有几百处直接引用 C_*，与其把颜色塞进每个绘制函数的参数，不如让它们成为
+// 运行期可写的 inline 变量（C++17 inline variable，全进程一份）。
+// 唯一约定：**只有 ThemeApplyPalette 能改它们**（见 core/settings.cpp），
+// 其余模块一律只读。初始值是浅色调色板，静态初始化（常量表达式），没有初始化顺序问题。
+inline COLORREF C_CANVAS   = RGB(244, 242, 237);   // --canvas  #F4F2ED
+inline COLORREF C_SURFACE  = RGB(255, 253, 248);   // --surface #FFFDF8
+inline COLORREF C_SUBTLE   = RGB(231, 227, 219);   // --subtle  #E7E3DB
+inline COLORREF C_INK      = RGB(32, 37, 43);      // --ink     #20252B
+inline COLORREF C_MUTED    = RGB(116, 122, 125);   // --muted   #747A7D
+inline COLORREF C_LINE     = RGB(213, 208, 200);   // --line    #D5D0C8
+inline COLORREF C_VOLT     = RGB(255, 107, 53);    // --voltage #FF6B35
+inline COLORREF C_VOLTSOFT = RGB(255, 224, 210);   // --voltage-soft #FFE0D2
+inline COLORREF C_SUCCESS  = RGB(47, 155, 104);    // --success #2F9B68
+inline COLORREF C_DANGER   = RGB(216, 58, 58);     // --danger  #D83A3A
+inline COLORREF C_RINGSOFT = RGB(255, 232, 221);   // 焦点光晕 rgba(255,107,53,.14)
+// 弹层遮罩底色。浅色主题用墨色半透明，暗色主题必须换成纯黑：
+// 底色本身就是深色时，墨色遮罩几乎看不出「后面被压暗了」。
+inline COLORREF C_SCRIM    = RGB(32, 37, 43);
+// 当前生效的调色板是否暗色（绘制里少数需要按明暗分叉的地方读它，比如缩略图垫底色）
+inline bool     g_darkTheme = false;
 
 // ---------------------------------------------------------------- 尺寸
 inline constexpr int P_W         = 560;

@@ -18,6 +18,18 @@
 
 using namespace wv;
 
+// 像素副本只在临时目录里（内存预算已释放）时把内容读回来。
+// 失败（文件被清理、目录不可达）就保持空 bits —— 那一格的缩略图会变成占位，
+// 但列表本身还能用；这比「读到半截数据当图片解码」好得多。
+bool EnsureItemBits(ClipItem& it) {
+    if (!it.bits.empty()) return true;
+    if (it.diskPath.empty()) return false;
+    std::vector<BYTE> buf;
+    if (!ReadAllBytes(it.diskPath, buf)) return false;
+    it.bits = std::move(buf);
+    return true;
+}
+
 bool PngToRgba(const std::vector<BYTE>& png, Rgba& out) {
     InitWic();
     if (!g_wic || png.size() < 32) return false;

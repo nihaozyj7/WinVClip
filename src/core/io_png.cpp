@@ -39,6 +39,30 @@ bool WriteAllBytes(const std::wstring& path, const void* data, size_t n) {
     return ok;
 }
 
+bool ReadAllBytes(const std::wstring& path, std::vector<BYTE>& out, size_t maxBytes) {
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || (size_t)sz.QuadPart > maxBytes) {
+        CloseHandle(h);
+        return false;
+    }
+    out.resize((size_t)sz.QuadPart);
+    size_t got = 0;
+    bool ok = true;
+    while (ok && got < out.size()) {
+        DWORD chunk = (out.size() - got) > (1u << 20) ? (1u << 20) : (DWORD)(out.size() - got);
+        DWORD rd = 0;
+        ok = ReadFile(h, out.data() + got, chunk, &rd, nullptr) && rd == chunk;
+        got += chunk;
+    }
+    CloseHandle(h);
+    if (!ok) out.clear();
+    return ok;
+}
+
 bool SaveRgbaAsPng(const Rgba& img, const std::wstring& path) {
     InitWic();
     if (!g_wic || img.px.empty() || img.w <= 0 || img.h <= 0) return false;

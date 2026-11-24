@@ -15,6 +15,7 @@
 #include "clipboard/paste.h"
 #include "core/app_state.h"
 #include "core/model.h"
+#include "core/settings.h"     // g_cfg（齿轮旁的开关状态等）
 #include "core/text_measure.h"
 #include "core/text_util.h"
 #include "core/theme.h"
@@ -41,6 +42,9 @@ int HitResize(POINT p) {
     int e = S(RESIZE_EDGE);
     bool inL = p.x < e, inR = p.x >= rc.right - e;
     bool inT = p.y < e, inB = p.y >= rc.bottom - e;
+    // 列表区右缘让位给滚动条：滑块就贴在右缘（见 layout.cpp 的 ComputeScrollbar），
+    // 不让位的话按下去直接进了改尺寸，滚动条永远拖不动。
+    if (inR && L.scrollMax > 0 && p.y >= L.body.top && p.y < L.body.bottom) inR = false;
     if (inT && inL) return RS_TL;
     if (inT && inR) return RS_TR;
     if (inB && inL) return RS_BL;
@@ -101,14 +105,229 @@ void WheelBody(int delta) {
         return;
     }
     if (g_page == PG_HISTORY || g_page == PG_FAV) {
-        if (delta > 0) { if (g_top > 0) --g_top; }
-        else { int maxTop = (int)g_view.size() - L.nRow; if (g_top < maxTop) ++g_top; }
+        // 一格滚轮 = 一行（触控板的零碎 delta 按比例走），并交给缓动定时器推进：
+        // 一帧跳整行的话，观感是「一批格子换成另一批」，不是滚动
+        ScrollListByPx(-delta * ListRowH() / WHEEL_DELTA);
+        TickListScroll();      // 先走一帧：第一次滚轮就要有位移，别等 16ms 定时器
     } else {
-        int step = S(56);
-        g_gridScroll += (delta > 0) ? -step : step;
-        ClampGridScroll();
+        // 一格滚轮 = 一行格子（52px），也交给缓动定时器推进：一帧跳整行的话
+        // 观感是「一整排格子瞬间换掉」，不是滚动。
+        ScrollGridByPx(-delta * (S(44) + S(5)) / WHEEL_DELTA);
+        TickListScroll();      // 先走一帧：第一次滚轮就要有位移，别等 16ms 定时器
+        // 滚动条几何（ComputeScrollbar）挂在 ComputeLayout 里：不重算的话
+        // 视图滚了、滑块却钉在原地，看着就像「滚动条对滚轮没响应」。
+        ComputeLayout();
     }
     Redraw(&L.body);      // 滚动只影响列表区，外框/标题/页脚保持原样
+}
+
+// 光标底下是哪一行 / 哪一格（客户区坐标，未命中就留 -1）。
+// WM_MOUSEMOVE 与滚动共用这一份命中逻辑：滚动时行在光标底下移动，不重算的话
+// 悬停/选中会停在旧的行号上，看起来就像「列表项自己跳了一下」。
+static void HitListAt(POINT p, int* row, int* cell) {
+    if (g_page == PG_HISTORY || g_page == PG_FAV) {
+        for (int i = 0; i < L.nRow; ++i)
+            if (PtIn(L.row[i], p)) { *row = g_top + i; return; }
+        return;
+    }
+    // 表情与符号共用同一套网格几何
+    const std::vector<GItem>& list = GlyphItems(g_page);
+    // 从第一个可见行起查：滚到深处时不必从第 0 条空转
+    int stepG = S(44) + S(5);
+    int firstG = (g_gridScroll > S(8)) ? ((g_gridScroll - S(8)) / stepG) * GlyphCols() : 0;
+    for (int i = firstG; i < (int)list.size(); ++i) {
+        RECT c = GlyphCellRect(i);
+        if (c.top > L.body.bottom) break;
+        if (PtIn(c, p)) { *cell = i; return; }
+    }
+}
+
+// 滚动一帧之后重算悬停：行的位置变了、鼠标没动（没有 WM_MOUSEMOVE），
+// 悬停状态却还指着旧的行下标——这是「滚动时列表项有跳动感」的一半来源
+// （另一半是缓动曲线，见 layout.cpp 的 SetListScroll）。
+static void SyncHoverFromCursor(HWND hwnd) {
+    POINT p; GetCursorPos(&p);
+    ScreenToClient(hwnd, &p);
+    int oldRow = g_hoverRow, oldCell = g_hoverCell;
+    g_hoverRow = -1;
+    g_hoverCell = -1;
+    bool onBar = (L.scrollMax > 0 && PtIn(L.scrollTrack, p));   // 光标压在滚动条上不算悬停
+    if (!g_drawerOpen && !onBar && PtIn(L.body, p)) {
+        HitListAt(p, &g_hoverRow, &g_hoverCell);
+        if (g_hoverRow >= 0) g_sel = g_hoverRow;   // 悬停即选中，与 WM_MOUSEMOVE 同规则
+    }
+    if (oldRow != g_hoverRow || oldCell != g_hoverCell) Redraw(&L.body);
+}
+
+// ---------------------------------------------------------------- 单击语义
+// 所有「点一下就生效」的动作都在 WM_LBUTTONUP 里执行：按下只记「预备点的是哪个
+// 控件」，松开时若还落在同一个控件上才真执行（标准按钮语义）。好处是按住后挪开
+// 再松开不会误粘贴一条、也不会误关面板。
+// 唯一的例外是三种连续手势——拖滚动条、抓边改尺寸、拖窗口：它们必须从按下开始，
+// 改成松开才动的话这三样就全都没法用了（见 WM_LBUTTONDOWN）。
+//
+// 按下与松开共用同一个解析器，才判得出「是不是同一个控件」。解析顺序必须与绘制
+// 层级一致（确认卡片 > 右键菜单 > 抽屉 > 标题栏 > 页签/chips > 列表）。
+enum : int {
+    CT_NONE = 0,
+    // 单体控件（数值必须 < CT_CHIP0）
+    CT_CLOSE = 1, CT_GEAR, CT_PIN,
+    CT_TAB0,                       // +0..3
+    CT_MORE = 8, CT_SEARCH, CT_DRAWER_CLOSE,
+    CT_MENU_OUT, CT_DRAWER_OUT,    // 点在弹层外：只收起弹层
+    CT_MODAL_OK, CT_MODAL_OUT,
+    // 带下标的范围（各自留够空位，别互相压到）
+    CT_CHIP0 = 20,                 // +chip 下标（最多 8 个）
+    CT_DRAWER_ITEM0 = 40,          // +DrawerHit 下标（< 100）
+    CT_MENU0 = 200,                // +菜单项下标（MI_COUNT 个）
+    CT_ROW0 = 400,                 // +视口内行下标（< 600）
+    CT_GLYPH0 = 1000,              // +GlyphItems 下标（不封顶）
+};
+
+// 按下时的目标；CT_NONE = 这次按下不该触发任何动作（空白处、手势区）
+static int s_pressTag = CT_NONE;
+
+// 确认卡片的「确定」按钮矩形（面板与设置窗口各算一份，见 SettingsModalRect 的注释）
+static RECT ModalOkRect() {
+    RECT m = ModalRect();
+    int bw = (m.right - m.left - S(40) - S(8)) / 2;
+    int by = m.bottom - S(20) - S(38);
+    return RECT{m.left + S(20), by, m.left + S(20) + bw, by + S(38)};
+}
+
+static int ClickTarget(POINT pt) {
+    if (g_modalOpen) return PtIn(ModalOkRect(), pt) ? CT_MODAL_OK : CT_MODAL_OUT;
+
+    // 菜单开着时点菜单外只收菜单（与旧行为一致：RunMenuItem(-1) 就是关菜单）。
+    // 不能让这一下漏到下面的行命中上，否则会「关菜单的同时粘贴一条」。
+    if (g_menuOpen) {
+        int hit = MenuHit(pt);
+        return (hit >= 0) ? CT_MENU0 + hit : CT_MENU_OUT;
+    }
+
+    // 点搜索框 → 进入输入态。中文搜索要靠输入法，而输入法组合必须有真正的键盘
+    // 焦点，只能把前台交给面板。这是唯一会让目标窗口光标暂时消失的入口，由用户
+    // 主动点击触发；Esc 关掉面板即刻还原。
+    if (PtIn(L.searchBox, pt)) return CT_SEARCH;
+
+    // 分类抽屉：点条目选中分类、点关闭或点抽屉外收起
+    if (g_drawerOpen && PtIn(L.drawer, pt)) {
+        if (PtIn(L.drawerClose, pt)) return CT_DRAWER_CLOSE;
+        int hit = DrawerHit(pt);
+        return (hit >= 0) ? CT_DRAWER_ITEM0 + hit : CT_NONE;
+    }
+    // 抽屉开着时点别处：先收起抽屉。标题栏区域放行，否则要关个窗口得点两次
+    if (g_drawerOpen && pt.y >= S(HEAD_H)) return CT_DRAWER_OUT;
+
+    // ---- 下面这三块是手势区，按下就交给 WM_LBUTTONDOWN 去拖，不算点击 ----
+    // 滚动条：贴在右缘的细条，必须排在「抓边改尺寸」之前（HitResize 对列表区让位）。
+    if (L.scrollMax > 0 && PtIn(L.scrollTrack, pt)) return CT_NONE;
+    // 窗口边缘/角落：抓到就改尺寸。必须排在标题栏拖动之前（顶部那条 5px 落在
+    // 标题栏里，先判 resize 才不会误触发拖动）
+    if (HitResize(pt) != RS_NONE) return CT_NONE;
+    // 标题栏空白处：拖动窗口
+    if (PtIn(L.head, pt) && !PtIn(L.gear, pt) && !PtIn(L.closeB, pt) && !PtIn(L.pinB, pt)) {
+        bool onTab = false;
+        for (int i = 0; i < 4; ++i)
+            if (PtIn(L.tab[i], pt)) { onTab = true; break; }
+        if (!onTab) return CT_NONE;
+    }
+
+    // ---- 剩下的都是「点一下」的控件 ----
+    if (PtIn(L.closeB, pt)) return CT_CLOSE;
+    if (PtIn(L.gear, pt))   return CT_GEAR;
+    if (PtIn(L.pinB, pt))   return CT_PIN;
+    for (int i = 0; i < 4; ++i)
+        if (PtIn(L.tab[i], pt)) return CT_TAB0 + i;
+    for (int i = 0; i < L.nChip && i < 8; ++i)
+        if (PtIn(L.chip[i], pt)) return CT_CHIP0 + i;
+    if (L.moreBtn.right > L.moreBtn.left && PtIn(L.moreBtn, pt)) return CT_MORE;
+
+    if (!PtIn(L.body, pt)) return CT_NONE;
+    if (g_page == PG_HISTORY || g_page == PG_FAV) {
+        for (int i = 0; i < L.nRow; ++i)
+            if (PtIn(L.row[i], pt)) return CT_ROW0 + i;
+        return CT_NONE;
+    }
+    const std::vector<GItem>& list = GlyphItems(g_page);
+    int stepG = S(44) + S(5);
+    int firstG = (g_gridScroll > S(8)) ? ((g_gridScroll - S(8)) / stepG) * GlyphCols() : 0;
+    for (int i = firstG; i < (int)list.size(); ++i) {
+        RECT c = GlyphCellRect(i);
+        if (c.top > pt.y) break;     // 行的 top 自上而下递增，越过光标的行就不必再看
+        if (PtIn(c, pt)) return CT_GLYPH0 + i;
+    }
+    return CT_NONE;
+}
+
+// 执行一次单击。几何由调用方先 ComputeLayout。
+static void RunClick(HWND hwnd, int tag) {
+    if (tag >= CT_GLYPH0) {
+        int i = tag - CT_GLYPH0;
+        const std::vector<GItem>& list = GlyphItems(g_page);
+        if (i >= 0 && i < (int)list.size()) PasteGlyph(g_page, list[i]);
+        return;
+    }
+    if (tag >= CT_ROW0 && tag < CT_ROW0 + 600) {
+        int i = tag - CT_ROW0;
+        if (i < 0 || i >= L.nRow) return;
+        g_sel = g_top + i;
+        PasteItem(g_top + i);
+        return;
+    }
+    if (tag >= CT_MENU0 && tag < CT_MENU0 + MI_COUNT) { RunMenuItem(tag - CT_MENU0); return; }
+    if (tag >= CT_DRAWER_ITEM0 && tag < CT_DRAWER_ITEM0 + 100) {
+        int hit = tag - CT_DRAWER_ITEM0;
+        if (hit < 0 || hit >= (int)L.dCat.size()) return;
+        g_query.clear(); g_comp.clear();
+        SetGlyphCat(g_page, L.dCat[hit]);
+        g_drawerOpen = false;
+        g_drawerHover = -1;
+        BuildView(); ComputeLayout(); Redraw();
+        return;
+    }
+    if (tag >= CT_CHIP0 && tag < CT_CHIP0 + 8 && tag - CT_CHIP0 < L.nChip) {
+        int i = tag - CT_CHIP0;
+        int cat = L.chipCat[i];
+        if (g_page == PG_EMOJI || g_page == PG_SYMBOL) {
+            g_query.clear(); g_comp.clear();
+            SetGlyphCat(g_page, cat);
+            BuildView();
+        } else {
+            g_filter = cat; g_sel = 0; ResetListScroll();
+            BuildView();
+        }
+        ComputeLayout();
+        Redraw();
+        return;
+    }
+    if (tag >= CT_TAB0 && tag < CT_TAB0 + 4) { SetPage(tag - CT_TAB0); return; }
+
+    switch (tag) {
+    case CT_CLOSE: HidePanel(); return;
+    case CT_GEAR:  OpenSettings(); return;      // 齿轮唯一的用途：打开设置窗口（独立窗口）
+    case CT_PIN:   ToggleTemporaryPin(); return;
+    case CT_MORE:  ToggleDrawer(!g_drawerOpen); return;
+    case CT_MENU_OUT:   RunMenuItem(-1); return;
+    case CT_DRAWER_OUT: ToggleDrawer(false); return;
+    case CT_MODAL_OK:
+        if (g_modalKind == MODAL_CLEAR_HIST) ConfirmClearHistory();
+        else                                 ConfirmDelete();
+        return;
+    case CT_MODAL_OUT:
+        g_modalOpen = false;
+        Redraw();
+        return;
+    case CT_SEARCH:
+        // IsWindowVisible 兜住「面板已隐藏却仍收到投递消息」的情况，否则前台会停在
+        // 一个不可见的窗口上，而隐藏之后定时器也停了，没人再把它收回来。
+        if (IsWindowVisible(hwnd) && GetForegroundWindow() != hwnd) {
+            g_inputMode = true;
+            ForceForeground(hwnd);
+        }
+        return;
+    default: return;
+    }
 }
 
 // ================================================================== 窗口过程
@@ -122,21 +341,25 @@ void PanelKeyDown(int vk, bool ctrl) {
         // 组合反而把面板关了。
         if (!g_comp.empty()) return;
 
+        // 确认卡片优先于其他弹层：清空历史是从设置窗口里点出来的，卡片也画在那个窗口；
+        // 面板这边的卡片只用于删单条，同样要最先判。
         if (g_modalOpen) {
             if (vk == VK_ESCAPE) { g_modalOpen = false; Redraw(); return; }
             if (vk == VK_RETURN) {
-                if (g_modalRow >= 0 && g_modalRow < L.nRow && g_top + g_modalRow < (int)g_view.size()) {
-                    g_items.erase(g_items.begin() + g_view[g_top + g_modalRow]);
-                    g_sel = 0; g_top = 0;
-                }
-                g_modalOpen = false;
-                BuildView(); ComputeLayout();
-                Toast(L"已删除", true);
-                Redraw();
+                if (g_modalKind == MODAL_CLEAR_HIST) ConfirmClearHistory();
+                else                                 ConfirmDelete();
                 return;
             }
             return;
         }
+
+        // 设置是独立窗口（见 ui/settings_win.h）。面板这边只剩「拦一下按键」：
+        // 窗口过程在另一条线程之外的普通消息里，面板不该再消费任何键。
+        if (g_settingsOpen) {
+            if (vk == VK_ESCAPE) CloseSettings();
+            return;
+        }
+
         if (g_menuOpen) {
             if (vk == VK_ESCAPE) { g_menuOpen = false; Redraw(); return; }
             if (vk == VK_DOWN || vk == VK_UP) {
@@ -192,15 +415,13 @@ void PanelKeyDown(int vk, bool ctrl) {
         case VK_BACK:
             if (!g_query.empty()) {
                 g_query.pop_back();
-                g_sel = 0; g_top = 0;
+                g_sel = 0; ResetListScroll();
                 BuildView(); ComputeLayout(); Redraw();
             }
             return;
         case VK_DELETE:
             if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                g_modalOpen = true;
-                g_modalRow = g_sel - g_top;
-                Redraw();
+                RequestDeleteRow(g_sel - g_top);
             }
             return;
         case VK_TAB:
@@ -211,10 +432,11 @@ void PanelKeyDown(int vk, bool ctrl) {
 
 // 字符输入：同样两个入口（WM_CHAR / 钩子转发的字符）
 void PanelChar(wchar_t c) {
+    if (g_settingsOpen) return;      // 设置窗口开着时面板已收起，字符别落进搜索串
     if (c >= 32 && c != 127) {
         Trace("panel char '%c' query=%ls", (char)c, g_query.c_str());
         g_query.push_back(c);
-        g_sel = 0; g_top = 0;
+        g_sel = 0; ResetListScroll();
         BuildView(); ComputeLayout();
         Redraw();
     }
@@ -230,7 +452,14 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
-        if (wp == TIMER_TOAST) {
+        if (wp == TIMER_SCROLL) {
+            // 列表滚动的缓动：按时间插值推进一帧（曲线见 layout.cpp 的 SetListScroll）。
+            // 每帧把行位置重算一遍，顺便把「光标底下现在换成了哪一行」也对齐。
+            bool more = TickListScroll();
+            SyncHoverFromCursor(hwnd);
+            Redraw(&L.body);
+            if (!more) KillTimer(hwnd, TIMER_SCROLL);
+        } else if (wp == TIMER_TOAST) {
             KillTimer(hwnd, TIMER_TOAST);
             g_toastOn = false;
             Redraw();
@@ -332,7 +561,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             ImmReleaseContext(hwnd, himc);
         }
-        g_sel = 0; g_top = 0;
+        g_sel = 0; ResetListScroll();
         BuildView(); ComputeLayout();
         PositionImeCandidate(hwnd);
         Redraw();
@@ -370,6 +599,12 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_LBUTTONUP:
+        if (g_sbarDrag) {
+            g_sbarDrag = false;
+            ReleaseCapture();
+            Redraw(&L.body);
+            return 0;
+        }
         if (g_resizing) {
             g_resizing = RS_NONE;
             ReleaseCapture();
@@ -383,9 +618,31 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
             return 0;
         }
+        // 真正的单击在这里：松开时还落在按下时的同一个控件上才执行
+        // （按住后挪到别处再松开 = 取消，标准按钮语义）。
+        {
+            ComputeLayout();
+            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            int tag = ClickTarget(p);
+            int pressed = s_pressTag;
+            s_pressTag = CT_NONE;
+            if (tag != CT_NONE && tag == pressed) RunClick(hwnd, tag);
+        }
         return 0;
 
     case WM_MOUSEMOVE: {
+        // 拖滚动条：内容严格跟手，不走缓动（带惯性就成了「拖一下自己再滑一小段」）
+        if (g_sbarDrag) {
+            int span = (L.scrollTrack.bottom - L.scrollTrack.top) -
+                       (L.scrollThumb.bottom - L.scrollThumb.top);
+            if (span < 1) span = 1;
+            int off = (int)((long long)(GET_Y_LPARAM(lp) - L.scrollTrack.top - g_sbarGrab) *
+                            L.scrollMax / span);
+            SetScrollOffsetNow(off);
+            SyncHoverFromCursor(hwnd);     // 行跟着滑块走，悬停行要重算（光标在条上→清空）
+            Redraw(&L.body);
+            return 0;
+        }
         // 调整尺寸中：屏幕坐标差直接改窗口矩形
         if (g_resizing) {
             POINT sc{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -413,9 +670,10 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
+        // 设置窗口：现在是独立窗口，面板这边不参与它的悬停（打开设置时面板已收起）
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        int oldChip = g_hoverChip, oldRow = g_hoverRow, oldCell = g_hoverCell;
 
+        int oldChip = g_hoverChip, oldRow = g_hoverRow, oldCell = g_hoverCell;
         g_hoverChip = -1; g_hoverRow = -1; g_hoverCell = -1;
 
         if (PtIn(L.closeB, POINT{x, y})) g_hoverChip = 901;
@@ -435,22 +693,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (oldDH != g_drawerHover) Redraw();
                 return 0;
             }
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                for (int i = 0; i < L.nRow; ++i)
-                    if (PtIn(L.row[i], POINT{x, y})) { g_hoverRow = g_top + i; break; }
-            } else {
-                // 表情与符号共用同一套网格几何
-                const std::vector<GItem>& list = GlyphItems(g_page);
-                // 从第一个可见行起查：滚到深处时不必从第 0 条空转
-                int stepG = S(44) + S(5);
-                int firstG = (g_gridScroll > S(8))
-                             ? ((g_gridScroll - S(8)) / stepG) * GlyphCols() : 0;
-                for (int i = firstG; i < (int)list.size(); ++i) {
-                    RECT c = GlyphCellRect(i);
-                    if (c.top > L.body.bottom) break;
-                    if (PtIn(c, POINT{x, y})) { g_hoverCell = i; break; }
-                }
-            }
+            HitListAt(POINT{x, y}, &g_hoverRow, &g_hoverCell);
         }
 
         if (g_menuOpen) {
@@ -473,6 +716,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSELEAVE:
         g_hoverChip = g_hoverRow = g_hoverCell = -1;
+        g_setHover = -1;
         Redraw();
         return 0;
 
@@ -481,57 +725,40 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{x, y};
         ComputeLayout();
 
-        // 弹层优先
-        if (g_modalOpen) {
-            RECT m = ModalRect();
-            int bw = (m.right - m.left - S(40) - S(8)) / 2;
-            int by = m.bottom - S(20) - S(38);
-            RECT ok{m.left + S(20), by, m.left + S(20) + bw, by + S(38)};
-            if (PtIn(ok, pt)) {
-                if (g_modalRow >= 0 && g_modalRow < L.nRow && g_top + g_modalRow < (int)g_view.size())
-                    g_items.erase(g_items.begin() + g_view[g_top + g_modalRow]);
-                g_modalOpen = false;
-                g_sel = 0; g_top = 0;
-                BuildView(); ComputeLayout();
-                Toast(L"已删除", true);
-            } else {
-                g_modalOpen = false;
+        // 单击语义：按下只记「预备点的是哪个控件」，动作统一在 WM_LBUTTONUP 里执行
+        // （见 ClickTarget / RunClick）。按下就生效的只剩下面那三种连续手势。
+        s_pressTag = ClickTarget(pt);
+
+        // 弹层优先：确认卡片、右键菜单、抽屉盖住的东西不该同时被按下，否则会
+        // 「收起了弹层、同时又发起一次拖动」。这几支到此为止，动作留给松开的 tag。
+        // 标题栏空白处是例外（tag = CT_NONE），抽屉开着也仍能拖窗口。
+        if (g_modalOpen || g_menuOpen) return 0;
+        if (g_drawerOpen && s_pressTag != CT_NONE) return 0;
+
+        // 命中一个「点一下」的控件：按下不动，等松开再执行
+        if (s_pressTag != CT_NONE) return 0;
+
+        // ---- 以下三种是连续手势，必须从按下开始（松开才动就全都没法用了）----
+
+        // 滚动条：贴在右缘的细条，必须排在「抓边改尺寸」之前（HitResize 对列表区让位）。
+        // 命中带比视觉上的 5px 宽（见 ComputeScrollbar 的 scrollTrack）：细条本身按不准。
+        if (L.scrollMax > 0 && PtIn(L.scrollTrack, pt)) {
+            int span = (L.scrollTrack.bottom - L.scrollTrack.top) -
+                       (L.scrollThumb.bottom - L.scrollThumb.top);
+            if (span < 1) span = 1;
+            if (pt.y < L.scrollThumb.top || pt.y >= L.scrollThumb.bottom) {
+                // 点在轨道空白：先把滑块中心挪到光标处（系统滚动条也是这个手感），再接着拖
+                int off = (int)((long long)(pt.y - L.scrollTrack.top -
+                                            (L.scrollThumb.bottom - L.scrollThumb.top) / 2) *
+                                L.scrollMax / span);
+                SetScrollOffsetNow(off);
             }
-            Redraw();
+            g_sbarDrag = true;
+            g_sbarGrab = pt.y - L.scrollThumb.top;   // 保持「按住的点在滑块内的相对位置」
+            SetCapture(hwnd);
+            Redraw(&L.body);
             return 0;
         }
-
-        if (g_menuOpen) {
-            RunMenuItem(MenuHit(pt));
-            return 0;
-        }
-
-        // 点搜索框 → 进入输入态。中文搜索要靠输入法，而输入法组合必须有真正的
-        // 键盘焦点，只能把前台交给面板。这是唯一会让目标窗口光标暂时消失的入口，
-        // 由用户主动点击触发；Esc 关掉面板即刻还原。
-        // IsWindowVisible 兜住「面板已隐藏却仍收到投递消息」的情况，否则前台会停在
-        // 一个不可见的窗口上，而隐藏之后定时器也停了，没人再把它收回来。
-        if (IsWindowVisible(hwnd) && PtIn(L.searchBox, pt) && GetForegroundWindow() != hwnd) {
-            g_inputMode = true;
-            ForceForeground(hwnd);
-            return 0;
-        }
-
-        // 分类抽屉：点条目选中分类、点关闭或点抽屉外收起
-        if (g_drawerOpen && PtIn(L.drawer, pt)) {
-            if (PtIn(L.drawerClose, pt)) { ToggleDrawer(false); return 0; }
-            int hit = DrawerHit(pt);
-            if (hit >= 0) {
-                g_query.clear(); g_comp.clear();
-                SetGlyphCat(g_page, L.dCat[hit]);
-                g_drawerOpen = false;
-                g_drawerHover = -1;
-                BuildView(); ComputeLayout(); Redraw();
-            }
-            return 0;
-        }
-        // 抽屉开着时点别处：先收起抽屉。标题栏区域放行，否则要关个窗口得点两次
-        if (g_drawerOpen && pt.y >= S(HEAD_H)) { ToggleDrawer(false); return 0; }
 
         // 窗口边缘/角落 → 抓取改变尺寸。必须排在标题栏拖动之前：
         // 顶部那条 5px 落在标题栏里，先判 resize 才不会误触发拖动
@@ -564,67 +791,8 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // 窗口控制
-        if (PtIn(L.closeB, pt)) { HidePanel(); return 0; }
-        if (PtIn(L.gear, pt)) {
-            // TODO: 设置弹层待实现（当前点击不做任何事）
-            return 0;
-        }
-        if (PtIn(L.pinB, pt)) { ToggleTemporaryPin(); return 0; }
-
-        // 页签
-        for (int i = 0; i < 4; ++i) {
-            if (PtIn(L.tab[i], pt)) { SetPage(i); return 0; }
-        }
-
-        // chips
-        for (int i = 0; i < L.nChip; ++i) {
-            if (PtIn(L.chip[i], pt)) {
-                int cat = L.chipCat[i];
-                if (g_page == PG_EMOJI || g_page == PG_SYMBOL) {
-                    g_query.clear(); g_comp.clear();
-                    SetGlyphCat(g_page, cat);
-                    BuildView();
-                } else {
-                    g_filter = cat; g_sel = 0; g_top = 0;
-                    BuildView();
-                }
-                ComputeLayout();
-                Redraw();
-                return 0;
-            }
-        }
-        if (L.moreBtn.right > L.moreBtn.left && PtIn(L.moreBtn, pt)) {
-            ToggleDrawer(!g_drawerOpen);
-            return 0;
-        }
-
-        // 主体
-        if (PtIn(L.body, pt)) {
-            if (g_page == PG_HISTORY || g_page == PG_FAV) {
-                for (int i = 0; i < L.nRow; ++i) {
-                    if (PtIn(L.row[i], pt)) {
-                        int vi = g_top + i;
-                        g_sel = vi;
-                        PasteItem(vi);
-                        return 0;
-                    }
-                }
-            } else {
-                const std::vector<GItem>& list = GlyphItems(g_page);
-                int stepG = S(44) + S(5);
-                int firstG = (g_gridScroll > S(8))
-                             ? ((g_gridScroll - S(8)) / stepG) * GlyphCols() : 0;
-                for (int i = firstG; i < (int)list.size(); ++i) {
-                    RECT c = GlyphCellRect(i);
-                    if (c.top > pt.y) break;     // 行的 top 自上而下递增，越过光标就不必再看
-                    if (PtIn(c, pt)) {
-                        PasteGlyph(g_page, list[i]);
-                        return 0;
-                    }
-                }
-            }
-        }
+        // 其余控件（关闭 / 齿轮 / 置顶 / 页签 / chips / 列表项 / 字形格）都在
+        // WM_LBUTTONUP 里按 tag 执行，按下时什么也不做
         return 0;
     }
 
@@ -653,6 +821,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         WheelBody(delta);
+        SyncHoverFromCursor(hwnd);         // 滚轮当场就位移了一帧，悬停行要跟着对齐
         return 0;
     }
 

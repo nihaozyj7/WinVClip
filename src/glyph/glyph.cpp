@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "glyph/glyph_data.h"
+#include "core/history_store.h"   // HistoryTouch（「最近使用」也要跨进程保留）
 #include "core/text_util.h"
 
 using namespace wv;
@@ -291,6 +292,7 @@ void AddRecentGlyph(int page, const GItem& it) {
     }
     list.insert(list.begin(), std::move(r));
     if (list.size() > 80) list.resize(80);
+    HistoryTouch();
 }
 
 // 符号字形的字体兜底：Segoe UI Symbol 覆盖不到数学字母、古文字等区块，

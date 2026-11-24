@@ -23,6 +23,9 @@
 // 整帧绘制入口（WM_PAINT / 主动 Redraw 都走它）
 void PaintPanel(HWND hwnd);
 
+// 设置窗口的整帧绘制入口（设置是独立窗口，见 ui/settings_win.h）
+void PaintSettingsWindow(HWND hwnd);
+
 // IME 候选窗跟随：中文组合串位置变化时把候选窗挪到组合串下面
 void PositionImeCandidate(HWND hwnd);
 

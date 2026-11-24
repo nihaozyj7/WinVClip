@@ -27,3 +27,15 @@ void MakeFonts();
 // 创建 D2D 工厂、DCRenderTarget、椭圆 trimming sign 等一次性设备对象
 void InitD2D();
 
+// 设备是否还活着（闲置回收后为 false，绘制前要靠 EnsureD2D 重建）
+bool D2DAlive();
+
+// 保证设备可用：已释放就重建（含字体与 DWrite 格式）。返回是否可用。
+bool EnsureD2D();
+
+// 释放全部 D2D/DWrite 设备对象与字体格式。
+// 实测一套「D2D 工厂 + DCRenderTarget + 首次绘制」在进程里会独占一块 25~32MB 的
+// PAGE_NOCACHE 私有内存池，且只有把工厂一起放掉才会归还；面板隐藏期间没必要留着。
+// 重建代价约 60ms（DLL 已加载的前提下），所以只在闲置回收路径上调用。
+void ReleaseD2D();
+

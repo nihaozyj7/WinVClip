@@ -102,4 +102,30 @@ void InitD2D() {
     g_d2d->CreateStrokeStyle(ss, nullptr, 0, &g_roundStroke);
 
     g_dw->CreateEllipsisTrimmingSign(nullptr, &g_ellipsis);
+}
+
+bool D2DAlive() { return g_rt && g_d2d && g_dw && g_brush; }
+
+void ReleaseD2D() {
+    // 顺序与进程退出路径一致：先放「依赖工厂的对象」，再放工厂本身。
+    // 只放工厂而不放 target 的话，软件设备池不会归还（实测 private 只掉 3MB）。
+    for (auto& kv : g_tfmt) if (kv.second) kv.second->Release();
+    g_tfmt.clear();
+    for (auto& p : g_probe) if (p) { p->Release(); p = nullptr; }
+    if (g_emojiFmt)   { g_emojiFmt->Release();   g_emojiFmt = nullptr; }
+    if (g_ellipsis)   { g_ellipsis->Release();   g_ellipsis = nullptr; }
+    if (g_roundStroke){ g_roundStroke->Release();g_roundStroke = nullptr; }
+    if (g_brush)      { g_brush->Release();      g_brush = nullptr; }
+    if (g_rt)         { g_rt->Release();         g_rt = nullptr; }
+    if (g_dw)         { g_dw->Release();         g_dw = nullptr; }
+    if (g_d2d)        { g_d2d->Release();        g_d2d = nullptr; }
+    g_painting = false;
+}
+
+bool EnsureD2D() {
+    if (D2DAlive()) return true;
+    InitD2D();
+    if (!D2DAlive()) return false;
+    MakeFonts();          // 字体格式挂在 DWrite 工厂上，工厂换了必须重建
+    return true;
 }

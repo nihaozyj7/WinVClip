@@ -49,3 +49,30 @@ void SaveItemAs(int idx);
 
 // 右键菜单项的执行入口（下标见 layout.h 的 MI_*）
 void RunMenuItem(int hit);
+
+// 删除单条历史（row = 相对当前视图顶部的行号）。按设置决定直接删还是先弹确认卡片，
+// 三个入口（Del 键、右键菜单、卡片确认）都收敛到这两个函数。
+void RequestDeleteRow(int row);
+void ConfirmDelete();
+
+// ---------------------------------------------------------------- 设置窗口
+// 打开/关闭设置窗口（独立窗口，见 ui/settings_win.h；打开时面板会被收起）
+void OpenSettings();
+void CloseSettings();
+// which: 0 = 开机自启动，1 = 以管理员身份运行，2 = 删除前二次确认
+void SettingsToggle(int which);
+// mode 见 core/settings.h 的 THEME_*
+void SettingsSetTheme(int mode);
+// 历史上限按步长增减（delta = ±HIST_STEP）
+void SettingsStepHistory(int delta);
+// 选临时文件目录（系统文件夹选择器）
+void SettingsPickTempDir();
+
+// 清空剪贴板历史（设置窗口里的危险操作：确认卡片也画在设置窗口里）。
+// 只删「既不置顶也不收藏」的记录：置顶与收藏是用户显式标记过的数据，不与历史互通
+// ——清空不动它们，历史上限裁剪也不动它们（见 clipboard/capture.cpp 的
+// ApplyHistoryLimit）。先弹确认卡片，确认后立刻落盘。
+void RequestClearHistory();
+void ConfirmClearHistory();
+// 这次清空会删掉几条（卡片文案要显示具体数字）；置顶/收藏不计入
+int  ClearHistoryCount();

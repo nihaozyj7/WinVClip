@@ -18,6 +18,8 @@
 
 #include <string>
 
+#include "core/model.h"   // ClipItem（DropItemTemp 的参数）
+
 // WM_CLIPBOARDUPDATE 的入口：只排一个延迟定时器，不在消息里直接读
 void OnClipboardChanged();
 
@@ -26,3 +28,15 @@ std::wstring ForegroundSource();
 
 // 真正读取剪贴板并写入历史（由延迟定时器触发）
 void CaptureClipboard();
+
+// 历史上限（设置里可改）：按当前 g_cfg.historyLimit 裁掉最旧的条目。
+// 改设置后立刻调用一次，用户才看得见「500 条变成 200 条」的效果。
+void ApplyHistoryLimit();
+
+// 删除一条图片条目的临时副本（条目被删/被顶替时调用，别把像素文件留成垃圾）
+void DropItemTemp(const ClipItem& it);
+
+// 剪贴板里现在装的是不是这一条（比文本正文 / 文件路径列表；图片不比较，见实现）。
+// 用途只有一个：删除一条时若它还躺在剪贴板里，就把当前序列号记进 g_delClipSeq，
+// 让下一次 CaptureClipboard 别再把它捡回来。
+bool ClipboardHoldsItem(const ClipItem& it);

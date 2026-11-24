@@ -16,7 +16,7 @@
 
 ```
 src/
-├── core/        零依赖。只依赖 Win32 与 STL
+├── core/        只依赖 Win32、STL 与 vendored 的 SQLite（只有 history_store 用它）
 │   ├── theme.h          配色 / 尺寸 / 窗口类名。改视觉只看这一个文件
 │   ├── text_util.*      字符串与编码（Lower / U8N / W2U8 …）
 │   ├── text_measure.*   Fmt / TextW：GDI 字体令牌 ↔ DWrite 文本格式的对应与宽度缓存
@@ -24,6 +24,8 @@ src/
 │   ├── io_png.*         WIC 工厂与 PNG 编解码
 │   ├── util.*           文件名 / 相对时间 / 可读大小 / 字节计数 / DPI 缩放 S()
 │   ├── model.h          ClipItem / GItem / GCat / Thumb 等纯数据结构
+│   ├── settings.*       用户设置：主题、临时目录、历史上限、自启/管理员（唯一落盘处）
+│   ├── history_store.*  历史与「最近使用」的读写（SQLite：<临时目录>\history\history.db）
 │   └── app_state.*      全部可变全局状态的唯一定义处（见下文）
 ├── render/      → core
 │   ├── dc.*             D2D 绘制原语（batch 边界、圆角、文字出口）
@@ -51,8 +53,12 @@ src/
 │   └── showhide.*       显示、隐藏与落点（「失焦即隐藏」的全部时序）
 └── app/         → 全部
     ├── hook.*           全局低级键盘/鼠标钩子 + 按键白名单
+    ├── startup.*        开机自启（Run 项 / 计划任务）与提权重启
     ├── tray.*           托盘图标
     └── main.cpp         只剩 MainProc / InitData / wWinMain
+
+third_party/
+└── sqlite3.c/.h   vendored 的 SQLite amalgamation（公共领域），只被 core/history_store 用
 ```
 
 ---
@@ -62,6 +68,8 @@ src/
 | 诉求 | 文件 |
 | --- | --- |
 | 改配色、圆角、间距、面板默认尺寸 | `core/theme.h` |
+| 加/改一个设置项（含暗色主题配色） | `core/settings.*` + `ui/layout.cpp` 的 ComputeSettings + `ui/paint.cpp` 的 PaintSettings + `ui/actions.cpp` |
+| 图片像素落在哪个临时目录 | `core/settings.h` 的 TempDir / TempImgDir |
 | 改某个区域的几何位置 | `ui/layout.cpp` 的 `ComputeLayout` |
 | 改某个区域的画法 | `ui/paint.cpp` 对应的 `PaintXxx` |
 | 加一个图标 | `render/icons.h` 的 `IconId` + `icons.cpp` 的 `DrawIcon` case |

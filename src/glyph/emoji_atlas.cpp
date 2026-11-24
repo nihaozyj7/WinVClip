@@ -19,6 +19,7 @@
 
 #include "core/app_state.h"     // g_panel / g_dpi / g_emojiFmt 等
 #include "core/model.h"         // GItem
+#include "core/settings.h"     // TempCacheDir / ConfigDir
 #include "core/text_util.h"
 #include "core/theme.h"
 #include "core/diag.h"           // WarmLog
@@ -41,7 +42,11 @@ static std::vector<unsigned char> g_emoReady;                 // 槽位 -> 像�
 static int g_emoFrame = 0;
 
 // 预热 / 落盘状态
-static std::vector<uint32_t> g_emoDisk;      // 预热期间的整块镜像，写完盘立刻释放
+// 预热期间的整块镜像用 VirtualAlloc 分配、用完立即 VirtualFree：
+// 19.5MB 的 vector 即使 clear+shrink_to_fit，CRT 也常把页留在进程提交里不还给系统，
+// 而这里是「一次性大块」，直接走虚拟内存 API 才能真回收（实测省 19.5MB 提交）。
+static uint32_t* g_emoDisk = nullptr;        // 镜像首地址（null = 未分配）
+static size_t    g_emoDiskSlots = 0;         // 镜像容量（以「格」为单位）
 static std::vector<EmoReq>   g_emoWarmJobs;  // 全量预热清单（UI 一次性写入，worker 只读）
 static std::atomic<int>      g_emoWarmIdx{0};
 static bool g_emoWarmPosted = false;         // 是否已开始预热（或已从缓存恢复）
@@ -51,7 +56,7 @@ static int  g_emoUpN        = 0;             // 已上传进 atlas 的槽数
 static bool g_emoCacheTried = false;         // 是否已尝试读盘
 static int  g_emoTotal      = 0;             // 全部 emoji 条数（决定图集容量）
 
-static std::vector<std::thread> g_emoThr;    // 2 个 worker
+static std::vector<std::thread> g_emoThr;    // 光栅化 worker（按需启动，闲置即退出）
 static std::mutex              g_emoMx;
 static std::condition_variable g_emoCv;
 static std::vector<EmoReq>     g_emoReq;     // 视口请求（后进先出）
@@ -63,6 +68,20 @@ void CollectEmojiCells(std::vector<std::pair<RECT, int>>& out);  // 定义在绘
 int GlyphCols();   // 定义在布局段
 int EmojiStride() { return g_emoSz + S(4); }
 int EmojiSide()   { return g_emoAtlasCols * EmojiStride(); }
+
+// -------------------------------------------------------------- 预热镜像（按需大块）
+static void FreeEmoDisk() {
+    if (g_emoDisk) { VirtualFree(g_emoDisk, 0, MEM_RELEASE); g_emoDisk = nullptr; }
+    g_emoDiskSlots = 0;
+}
+
+static void AllocEmoDisk(size_t slots, size_t perSlot) {
+    FreeEmoDisk();
+    if (!slots || !perSlot) return;
+    SIZE_T bytes = slots * perSlot * sizeof(uint32_t);
+    g_emoDisk = (uint32_t*)VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (g_emoDisk) g_emoDiskSlots = slots;
+}
 void EmojiWorkerMain(int sz) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const int stride = sz + S(4);
@@ -154,10 +173,9 @@ void EmojiWorkerMain(int sz) {
         std::lock_guard<std::mutex> lk(g_emoMx);
         g_emoPending.erase(r.key);
         // 预热期间顺手把像素留在整块镜像里，全部完成后一次写盘
-        if (r.slot >= 0 && !g_emoDisk.empty()) {
+        if (r.slot >= 0 && g_emoDisk && (size_t)r.slot < g_emoDiskSlots) {
             size_t off = (size_t)r.slot * stride * stride;
-            if (off + (size_t)stride * stride <= g_emoDisk.size())
-                std::memcpy(g_emoDisk.data() + off, px.data(), (size_t)stride * stride * 4);
+            std::memcpy(g_emoDisk + off, px.data(), (size_t)stride * stride * 4);
         }
         g_emoDone.push_back(EmoDone{r.slot, r.key, px});
     }
@@ -172,6 +190,7 @@ void EmojiWorkerMain(int sz) {
 }
 
 void StopEmojiWorker() {
+    if (g_emoThr.empty()) return;     // 只在 UI 线程调用，与 EnsureEmojiWorker 同线程，无线程竞争
     {
         std::lock_guard<std::mutex> lk(g_emoMx);
         g_emoQuit = true;
@@ -189,8 +208,6 @@ void ReleaseEmojiCache() {
         g_emoPending.clear();
         g_emoDone.clear();
         g_emoWarmJobs.clear();
-        g_emoDisk.clear();
-        g_emoDisk.shrink_to_fit();
         g_emoQuit = false;
         g_emoSlot.clear();
         g_emoSlotKey.clear();
@@ -198,10 +215,13 @@ void ReleaseEmojiCache() {
         g_emoReady.clear();
         g_emoFrame = 0;
     }
+    FreeEmoDisk();
     g_emoWarmIdx.store(0);
     if (g_emoAtlas) { g_emoAtlas->Release(); g_emoAtlas = nullptr; }
     g_emoSz = 0; g_emoAtlasCols = 0; g_emoAtlasSlots = 0; g_emoNextSlot = 0;
     g_emoWarmPosted = false; g_emoWarmSaved = false; g_emoWarmSlots = 0; g_emoUpN = 0;
+    // 释放之后再回到表情页必须能重新读盘（否则会退化成逐格重新光栅化，那正是「切分类要等」的来源）
+    g_emoCacheTried = false;
 }
 
 bool EnsureEmojiCache(int sz) {
@@ -244,9 +264,24 @@ bool EnsureEmojiCache(int sz) {
 
     std::lock_guard<std::mutex> lk(g_emoMx);
     g_emoQuit = false;
-    // 单线程光栅化首屏 63 格要 300ms 左右，两个 worker 并行能压到一半
-    for (int i = 0; i < 2; ++i) g_emoThr.emplace_back(EmojiWorkerMain, sz);
+    // 单线程光栅化首屏 63 格要 300ms 左右。这里只开 1 个 worker：
+    // 每多一个 worker 就要多一套 D2D/DWrite 设备，实测每套独占一块 25~32MB 的
+    // PAGE_NOCACHE 私有内存池（设备不能跨线程共享，只能各建一套）。
+    // 光栅化本身只在「首次生成缓存」时是全量跑，日常切分类全是磁盘缓存命中，
+    // 所以并行度换内存不划算——1 个 worker 只在无缓存的首轮多花一两秒。
+    g_emoThr.emplace_back(EmojiWorkerMain, sz);
     return true;
+}
+
+// worker 可能因为「预热跑完 / 闲置回收」被停掉，需要时再拉起来。
+// 每次 StopEmojiWorker 会把设备连同它缓存的光栅化结果一起还给系统。
+void EnsureEmojiWorker() {
+    if (!g_emoAtlas) return;
+    std::lock_guard<std::mutex> lk(g_emoMx);
+    if (!g_emoThr.empty()) return;
+    g_emoQuit = false;
+    const int sz = g_emoSz;
+    g_emoThr.emplace_back(EmojiWorkerMain, sz);
 }
 
 // 分配一个图集槽：先用没占过的，用尽后淘汰「最久没出现在视口里」的那个。
@@ -273,14 +308,9 @@ D2D1_RECT_F EmojiSlotRect(int slot) {
 }
 
 // -------------------------------------------------------------- 磁盘缓存
-std::wstring EmojiCacheDir() {
-    wchar_t buf[MAX_PATH] = L"";
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) GetTempPathW(MAX_PATH, buf);
-    std::wstring d = std::wstring(buf) + L"\\WinVClip";
-    CreateDirectoryW(d.c_str(), nullptr);
-    return d;
-}
+// 图集缓存是「可重建的大文件」，所以放设置里的临时目录（用户可能换到大盘）；
+// 面板尺寸记忆相反——它是配置，必须留在 %LOCALAPPDATA%，换临时目录不该把它弄丢。
+std::wstring EmojiCacheDir() { return TempCacheDir(); }
 
 std::wstring EmojiCacheFile() {
     wchar_t nm[96];
@@ -288,8 +318,8 @@ std::wstring EmojiCacheFile() {
     return EmojiCacheDir() + nm;
 }
 
-// 面板尺寸记忆：和字形缓存放同一目录，一行「宽 高」
-std::wstring ViewSizeFile() { return EmojiCacheDir() + L"\\view-size.txt"; }
+// 面板尺寸记忆：一行「宽 高」
+std::wstring ViewSizeFile() { return ConfigDir() + L"\\view-size.txt"; }
 
 void LoadViewSize() {
     FILE* fp = _wfopen(ViewSizeFile().c_str(), L"rb");
@@ -376,7 +406,7 @@ bool LoadEmojiCache() {
 
 // 把整块图集写盘。数据源是预热期间的镜像 g_emoDisk，写完即释放。
 void SaveEmojiCache() {
-    if (g_emoWarmSaved || g_emoDisk.empty() || !g_emoAtlas) return;
+    if (g_emoWarmSaved || !g_emoDisk || !g_emoAtlas) return;
     g_emoWarmSaved = true;
 
     const int stride = EmojiStride();
@@ -398,12 +428,11 @@ void SaveEmojiCache() {
         fwrite(&l, 4, 1, fp);
         fwrite(g_emoSlotKey[i].data(), 1, l, fp);
     }
-    fwrite(g_emoDisk.data(), 4, g_emoDisk.size(), fp);
+    fwrite(g_emoDisk, 4, g_emoDiskSlots * (size_t)stride * stride, fp);
     fclose(fp);
     WarmLog("  warm: saved slots=%d up=%d\n", g_emoAtlasSlots, g_emoUpN);
 
-    g_emoDisk.clear();
-    g_emoDisk.shrink_to_fit();
+    FreeEmoDisk();               // 直接 VirtualFree，页立刻还给系统
 }
 
 // 启动预热：读缓存命中就整块恢复，否则把全部 emoji 排进低优先队列
@@ -424,7 +453,7 @@ void StartEmojiWarm() {
 
     const int stride = EmojiStride();
     // 整块镜像：预热期间每一格都留一份，全部完成后一次写盘
-    g_emoDisk.assign((size_t)g_emoAtlasSlots * stride * stride, 0);
+    AllocEmoDisk((size_t)g_emoAtlasSlots, (size_t)stride * stride);
 
     std::vector<EmoReq> jobs;
     jobs.reserve(keys.size());
@@ -436,7 +465,7 @@ void StartEmojiWarm() {
         g_emoSlotKey[(size_t)slot] = k;
         jobs.push_back(EmoReq{k, slot});
     }
-    if (jobs.empty()) { g_emoDisk.clear(); g_emoDisk.shrink_to_fit(); WarmLog("  warm: no-jobs keys=%d slots=%d\n", (int)keys.size(), g_emoAtlasSlots); return; }
+    if (jobs.empty()) { FreeEmoDisk(); WarmLog("  warm: no-jobs keys=%d slots=%d\n", (int)keys.size(), g_emoAtlasSlots); return; }
 
     {
         std::lock_guard<std::mutex> lk(g_emoMx);
@@ -494,9 +523,17 @@ bool PumpEmojiUploads() {
     // 全部预热格都进 atlas 了：整块落盘，下次启动直接载入
     if (g_emoWarmSlots > 0 && !g_emoWarmSaved && g_emoUpN >= g_emoWarmSlots) SaveEmojiCache();
 
-    std::lock_guard<std::mutex> lk(g_emoMx);
-    return !g_emoPending.empty() || !g_emoDone.empty() ||
-           g_emoWarmIdx.load() < (int)g_emoWarmJobs.size();
+    bool more;
+    {
+        std::lock_guard<std::mutex> lk(g_emoMx);
+        more = !g_emoPending.empty() || !g_emoDone.empty() ||
+               g_emoWarmIdx.load() < (int)g_emoWarmJobs.size();
+    }
+    // 手头的活全部干完（预热落盘也已结束）：把 worker 连同它的 D2D 设备一起停掉。
+    // 设备是内存大户（每套 25~32MB 非缓冲私有池），而「全部字形都已在图集里」之后
+    // 它唯一的作用是将来遇到新字形时再光栅化——那种情况由 EnsureEmojiWorker 现拉起来。
+    if (!more) StopEmojiWorker();
+    return more;
 }
 
 // UI 线程每帧调一次：上传已完成的像素 + 投递缺失格。绝不做光栅化。
@@ -529,11 +566,39 @@ void PrepareEmojiBitmaps() {
 
     // 3) 投递缺失格。队列是后进先出，所以「先投预取、后投视口内」，
     //    这样视口内的格子总排在前面先被渲染。
+    //
+    //    ⚠ worker 在「活全干完」时会自行退出，把它那套 D2D/DWrite 设备还掉
+    //    （25~32MB，见 PumpEmojiUploads 末尾）。所以这里**只能按需拉起**：
+    //    早先无条件调 EnsureEmojiWorker() 的结果是「上一帧刚停、这一帧又建」，
+    //    而建一套软件 D2D 设备 + DWrite 工厂要几十毫秒——实测表情页滚动时
+    //    prep 段 35~53ms/帧，连带系统鼠标都一卡一卡的（低级鼠标钩子回调
+    //    排的正是同一个 UI 线程）。缓存命中、没有缺失格时必须一次设备都不建。
+    const int ec = GlyphCols();
+    int lo = 0, hi = -1;
+    if (!cells.empty()) {
+        lo = cells.front().second - ec;
+        hi = cells.back().second + ec;
+    }
+    bool need = false;
+    {
+        std::lock_guard<std::mutex> lk(g_emoMx);
+        for (int i = lo; i <= hi && !need; ++i) {
+            if (i < 0 || i >= (int)list.size()) continue;
+            const GItem& it = list[(size_t)i];
+            std::string key(it.g, (size_t)it.gl);
+            auto f = g_emoSlot.find(key);
+            if (f != g_emoSlot.end() && (size_t)f->second < g_emoReady.size() &&
+                g_emoReady[(size_t)f->second]) continue;                   // 已在图集里
+            if (g_emoPending.find(key) != g_emoPending.end()) continue;     // 已在路上
+            need = true;
+        }
+    }
+    if (need) EnsureEmojiWorker();
+
     bool posted = false;
     {
         std::lock_guard<std::mutex> lk(g_emoMx);
-        auto post = [&](int idx) {
-            if (idx < 0 || idx >= (int)list.size()) return;
+        auto post = [&](int idx) {            if (idx < 0 || idx >= (int)list.size()) return;
             const GItem& it = list[(size_t)idx];
             std::string key(it.g, (size_t)it.gl);
             auto f = g_emoSlot.find(key);
@@ -551,13 +616,8 @@ void PrepareEmojiBitmaps() {
             posted = true;
         };
         // 预取：视口上下各一行，滚动时下一屏通常已经就绪
-        const int ec = GlyphCols();
-        if (!cells.empty()) {
-            int lo = cells.front().second - ec;
-            int hi = cells.back().second + ec;
-            for (int i = lo; i <= hi; ++i)
-                if (i < cells.front().second || i > cells.back().second) post(i);
-        }
+        for (int i = lo; i <= hi; ++i)
+            if (i < cells.front().second || i > cells.back().second) post(i);
         for (auto& c : cells) post(c.second);
     }
     if (posted) g_emoCv.notify_one();

@@ -3,13 +3,18 @@
 
 #include <commdlg.h>
 #include <shlobj.h>
+#include <shobjidl.h>   // IFileOpenDialog（选临时目录）
+#include <deque>
 #include <vector>
 
+#include "app/startup.h"       // SetAutostart / RelaunchElevated / IsProcessElevated
 #include "clipboard/capture.h"
 #include "clipboard/paste.h"
 #include "core/app_state.h"    // 全部视图状态
 #include "core/diag.h"
+#include "core/history_store.h" // HistoryTouch / HistoryMigrateFrom（历史跨进程保留）
 #include "core/model.h"
+#include "core/settings.h"     // g_cfg / SettingsSave / ApplyThemeFromSettings
 #include "core/text_util.h"
 #include "core/theme.h"
 #include "core/util.h"
@@ -19,6 +24,7 @@
 #include "model/clip_model.h"
 #include "ui/caret.h"
 #include "ui/layout.h"
+#include "ui/settings_win.h"
 #include "ui/showhide.h"
 
 using namespace wv;
@@ -28,14 +34,23 @@ void Toast(const std::wstring& msg, bool info) {
     g_toast = msg;
     g_toastInfo = info;
     g_toastOn = true;
-    if (g_panel) {
+    // 只有「正在被谁看」的那个窗口才该起消隐定时器：面板隐藏时它的定时器照样会触发，
+    // 会把设置窗口里的提示提前清掉（实测提示还没看清就没了）。
+    if (g_panel && IsWindowVisible(g_panel)) {
         SetTimer(g_panel, TIMER_TOAST, 1500, nullptr);
         InvalidateRect(g_panel, nullptr, FALSE);
+    }
+    // 设置是独立窗口：改设置后的反馈（尤其失败原因）必须能在那个窗口里看见，
+    // 不能指望面板——打开设置时面板是隐藏的。
+    if (SettingsWindowVisible()) {
+        SetTimer(g_setWin, TIMER_TOAST, 3000, nullptr);        InvalidateRect(g_setWin, nullptr, FALSE);
     }
 }
 
 void Redraw(const RECT* r) {
     if (g_panel) InvalidateRect(g_panel, r, FALSE);
+    // r 是面板坐标，设置窗口整窗重绘（内容小，代价可以忽略）
+    if (SettingsWindowVisible()) InvalidateRect(g_setWin, nullptr, FALSE);
 }
 
 // 临时固定：仅本次显示有效（置顶 + 不失焦隐藏），面板关闭后自动取消
@@ -58,7 +73,7 @@ void ToggleTemporaryPin() {
 void SetPage(int p) {
     if (g_page == p) return;
     g_page = p;
-    g_sel = 0; g_top = 0; g_hoverRow = -1; g_hoverCell = -1;
+    g_sel = 0; ResetListScroll(); g_hoverRow = -1; g_hoverCell = -1;
     g_gridScroll = 0;
     g_menuOpen = false; g_modalOpen = false;
     g_drawerOpen = false; g_drawerHover = -1; g_drawerScroll = 0;
@@ -130,6 +145,7 @@ void TogglePinItem(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return;
     ClipItem& it = g_items[idx];
     it.pinned = !it.pinned;
+    HistoryTouch();
     Toast(it.pinned ? L"已置顶" : L"已取消置顶", true);
     BuildView();
     ComputeLayout();
@@ -140,6 +156,7 @@ void ToggleFav(int vi) {
     if (vi < 0 || vi >= (int)g_view.size()) return;
     ClipItem& it = g_items[g_view[vi]];
     it.fav = !it.fav;
+    HistoryTouch();
     Toast(it.fav ? L"已收藏" : L"已取消收藏", true);
     BuildView();
     ComputeLayout();
@@ -204,6 +221,8 @@ bool PickSavePath(const std::wstring& defName, const wchar_t* filter,
 void SaveItemAs(int idx) {
     if (idx < 0 || idx >= (int)g_items.size()) return;
     ClipItem it = g_items[idx];      // 拷一份：对话框是模态的，历史可能在此期间被改动
+    if (it.kind == 2) EnsureItemBits(it);   // 像素可能只在临时目录里
+    if (it.kind == 0) EnsureItemText(it);   // 超长正文可能只在数据库里
 
     if (it.kind == 1) {
         if (it.files.empty()) { Toast(L"这条没有可保存的文件", true); return; }
@@ -270,12 +289,313 @@ void RunMenuItem(int hit) {
     case MI_PIN:  TogglePinItem(item); break;
     case MI_SAVE: SaveItemAs(item); break;
     case MI_DELETE:
-        g_modalOpen = true;
-        g_modalRow = row;
-        Redraw();
+        RequestDeleteRow(row);
         break;
     default:
         Redraw();
         break;
     }
+}
+
+// 立即删掉视图里第 row 行（相对 g_top 的行号），不弹确认。
+// 视口保持不动：删一条之后 g_view 里后面的条目整体前移，原先的 g_sel 此刻指向的
+// 确实已经换成了另一条，但那是「同一行位置上剩下的那条」——正是用户接下来要看的。
+// 早先这里 g_sel = 0 + ResetListScroll()，结果每删一条视口就弹回顶部，清理历史时
+// 得一次次重新滚回去，手感极差。
+static bool DeleteRowNow(int row) {
+    if (row < 0 || g_top + row >= (int)g_view.size()) return false;
+    int idx = g_view[g_top + row];
+    if (idx < 0 || idx >= (int)g_items.size()) return false;
+    // 删的这条正好还躺在剪贴板里：记下当前序列号，否则下一次唤出面板时的补捕
+    // （ShowPanel → CaptureClipboard）会把它重新捡回历史顶部——用户看到的就是
+    // 「这一条怎么都删不掉」。见 app_state.h 的 g_delClipSeq。
+    ClipItem& victim = g_items[idx];
+    EnsureItemText(victim);            // 长文本正文只在库里，比剪贴板前要先取回来
+    if (ClipboardHoldsItem(victim)) g_delClipSeq = GetClipboardSequenceNumber();
+    DropItemTemp(victim);              // 图片像素副本一起删掉
+    g_items.erase(g_items.begin() + idx);
+    HistoryTouch();
+    int keepScroll = g_scrollY;       // 删之前视线停在哪，删完还停在哪
+    int keepSel = g_sel;
+    BuildView();
+    ComputeLayout();                  // ListScrollMax 依赖 L.body，得先有布局
+    g_sel = (keepSel < (int)g_view.size()) ? keepSel : (int)g_view.size() - 1;
+    if (g_sel < 0) g_sel = 0;
+    SetListScroll(keepScroll, false); // 只夹回合法范围（内容变短时贴底），不回顶
+    ComputeLayout();                  // SetListScroll 改了 g_top/g_rowOff，行矩形要跟着重算
+    Redraw();
+    return true;
+}
+
+// 「删除这一条」的唯一入口：Del 键、右键菜单、确认卡片都走这里。
+// 是否先弹确认只在这一处判，别在 panel 里各写一遍。
+void RequestDeleteRow(int row) {
+    if (row < 0 || row >= (int)g_view.size()) return;
+    if (g_cfg.confirmDelete) {
+        g_modalOpen = true;
+        g_modalKind = MODAL_DELETE_ONE;
+        g_modalRow = row;
+        Redraw();
+        return;
+    }
+    DeleteRowNow(row);
+    Toast(L"已删除", true);
+}
+
+// 确认卡片上点了「删除」（或按 Enter）
+void ConfirmDelete() {
+    g_modalOpen = false;
+    g_modalKind = MODAL_DELETE_ONE;
+    bool ok = DeleteRowNow(g_modalRow);
+    g_modalRow = -1;
+    Toast(ok ? L"已删除" : L"这条已经不在了", !ok);
+    Redraw();
+}
+
+// ================================================================== 清空剪贴板历史
+// 语义（用户明确要求，别自行简化）：置顶与收藏是用户显式标记过的数据，与历史是
+// 两条独立的线——
+//   · 清空历史不动它们；
+//   · 剪贴板记录上限裁剪也不动它们（见 clipboard/capture.cpp 的 ApplyHistoryLimit
+//     和 history_store.cpp 的 HistoryLoad：载入时也必须把它们全部取回来）。
+// 收藏页把它们单独列出来，历史页里也照旧看得到（星标式，不是「移出历史」式）。
+int ClearHistoryCount() {
+    int n = 0;
+    for (const auto& it : g_items) if (!it.pinned && !it.fav) ++n;
+    return n;
+}
+
+int ClearHistoryKeepPinnedFav() {
+    std::deque<ClipItem> keep;
+    int removed = 0;
+    bool clipHit = false;      // 剪贴板只会装一条，命中之后不必再逐条比
+    for (auto& it : g_items) {
+        if (it.pinned || it.fav) { keep.push_back(std::move(it)); continue; }
+        // 清掉的那批里若有「正躺在剪贴板里」的，同样要挡住唤出面板时的补捕
+        // （见 DeleteRowNow 的同一条注释）
+        if (!clipHit) {
+            EnsureItemText(it);
+            if (ClipboardHoldsItem(it)) {
+                g_delClipSeq = GetClipboardSequenceNumber();
+                clipHit = true;
+            }
+        }
+        DropItemTemp(it);      // 图片像素副本只被这一条引用，跟着一起删掉腾磁盘
+        ++removed;
+    }
+    if (removed == 0) return 0;
+    g_items.swap(keep);
+
+    // 清空是不可撤销的显式动作：立刻落盘，不等 HistoryTouch 的 900ms 防抖——
+    // 这段时间里被关机或任务管理器结束，「清空」就白做了。
+    HistoryFlush();
+
+    g_menuOpen = false;
+    g_menuItem = -1;
+    g_modalRow = -1;
+    g_hoverRow = -1;
+    BuildView();
+    ResetListScroll();
+    ComputeLayout();
+    Redraw();
+    return removed;
+}
+
+void RequestClearHistory() {
+    if (ClearHistoryCount() <= 0) {
+        Toast(L"没有可清空的记录（置顶与收藏会保留）", true);
+        Redraw();
+        return;
+    }
+    g_modalOpen = true;
+    g_modalKind = MODAL_CLEAR_HIST;
+    g_modalRow = -1;
+    Redraw();
+}
+
+void ConfirmClearHistory() {
+    g_modalOpen = false;
+    g_modalKind = MODAL_DELETE_ONE;   // 卡片复位成默认种类，别让下一次删单条画错文案
+    int n = ClearHistoryKeepPinnedFav();
+    Toast(n > 0 ? (L"已清空 " + std::to_wstring(n) + L" 条记录")
+                : L"没有可清空的记录", true);
+    Redraw();
+}
+
+// ================================================================== 设置窗口
+// 每一项都是「改 g_cfg → 立刻生效 → 落盘」三步。不要攒到退出时统一写：
+// 本程序是被关机/任务管理器结束也不会收到通知的常驻进程。
+//
+// 设置是独立窗口（见 ui/settings_win.h）：打开时先把面板收起——两者互斥，
+// 面板那套「失焦即隐藏 + 按键靠钩子转发」的规则不能套在一个普通窗口上。
+void OpenSettings() {
+    g_menuOpen = false;
+    g_modalOpen = false;
+    g_modalKind = MODAL_DELETE_ONE;
+    g_drawerOpen = false;
+    if (g_panel && IsWindowVisible(g_panel)) HidePanel();
+    ShowSettingsWindow();
+}
+
+void CloseSettings() {
+    CloseSettingsWindow();
+}
+
+void SettingsToggle(int which) {
+    if (which == 2) {
+        g_cfg.confirmDelete = !g_cfg.confirmDelete;
+        SettingsSave();
+        Toast(g_cfg.confirmDelete ? L"删除前会先确认" : L"删除将立即执行，不再确认", true);
+        Redraw();
+        return;
+    }
+    if (which == 0) {
+        g_cfg.autostart = !g_cfg.autostart;
+        SettingsSave();
+        std::wstring err;
+        bool ok = SetAutostart(g_cfg.autostart, &err);   // 内部按「设置 + 账户权限」选 Run 项或计划任务
+        if (!g_cfg.autostart) {
+            Toast(ok ? L"已取消开机自启" : (L"取消开机自启失败：" + err), !ok);
+        } else if (!ok) {
+            Toast(L"设置开机自启失败：" + err, true);
+        } else if (!err.empty()) {
+            // 成功但走了退让路径（比如计划任务没建成、先退回普通自启）
+            Toast(L"已设为开机自启（" + err + L"）", true);
+        } else {
+            bool hi = g_cfg.admin && IsUserInAdminGroup();
+            Toast(hi ? L"已设为开机自启（登录时以管理员身份启动）" : L"已设为开机自启", true);
+        }
+        Redraw();
+        return;
+    }
+    if (which != 1) return;
+
+    if (g_cfg.admin) {
+        // 关闭只影响下次启动：当前进程已经是管理员，降不回去。
+        g_cfg.admin = false;
+        SettingsSave();
+        if (g_cfg.autostart) SetAutostart(true, nullptr);   // 自启从计划任务退回 Run 项
+        Toast(L"下次启动起不再以管理员运行", true);
+        Redraw();
+        return;
+    }
+
+    // 标准用户既提不了权（UAC 上只能借别人的管理员凭据），也建不了「最高权限」的计划任务：
+    // 直接挡在这里，别让开关点亮之后什么也没发生。
+    if (!IsUserInAdminGroup()) {
+        Toast(L"当前账户不在管理员组，无法以管理员身份运行", true);
+        Redraw();
+        return;
+    }
+
+    // 打开：先落盘再提权重启。提权后的新实例启动时会对账，把自启换成计划任务
+    // （见 ReconcileAutostart）——只有管理员令牌能建 HighestAvailable 的任务。
+    g_cfg.admin = true;
+    SettingsSave();
+    if (IsProcessElevated()) {
+        if (g_cfg.autostart) SetAutostart(true, nullptr);
+        Toast(L"已开启管理员模式", true);
+        Redraw();
+        return;
+    }
+    if (RelaunchElevated()) {
+        if (g_main) DestroyWindow(g_main);     // 新实例接管，本进程退出
+        return;
+    }
+    // 用户在 UAC 对话框上点了「否」
+    g_cfg.admin = false;
+    SettingsSave();
+    Toast(L"未获得管理员权限，已取消", true);
+    Redraw();
+}
+
+void SettingsSetTheme(int mode) {
+    if (mode < THEME_LIGHT || mode > THEME_SYSTEM) return;
+    if (g_cfg.theme == mode) return;
+    g_cfg.theme = mode;
+    SettingsSave();
+    ApplyThemeFromSettings();
+    Redraw();
+}
+
+void SettingsStepHistory(int delta) {
+    int v = g_cfg.historyLimit + delta;
+    if (v < HIST_MIN) v = HIST_MIN;
+    if (v > HIST_MAX) v = HIST_MAX;
+    if (v == g_cfg.historyLimit) return;
+    g_cfg.historyLimit = v;
+    SettingsSave();
+    ApplyHistoryLimit();
+    HistoryTouch();          // 裁掉的条目也要从磁盘上消失
+    BuildView();
+    ComputeLayout();
+    Redraw();
+}
+
+// 选目录用系统的文件夹选择器：自绘面板里再做一个路径输入框要处理 IME、
+// 光标、粘贴、非法字符，成本远高于收益。
+static bool PickFolder(HWND owner, const std::wstring& init, std::wstring& out) {
+    IFileOpenDialog* dlg = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&dlg)))) {
+        DWORD opts = 0;
+        dlg->GetOptions(&opts);
+        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dlg->SetTitle(L"选择临时文件目录");
+        if (!init.empty()) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(init.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+                dlg->SetFolder(item);
+                item->Release();
+            }
+        }
+        if (SUCCEEDED(dlg->Show(owner))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item))) {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) {
+                    out = p;
+                    ok = true;
+                    CoTaskMemFree(p);
+                }
+                item->Release();
+            }
+        }
+        dlg->Release();
+    }
+    return ok;
+}
+
+void SettingsPickTempDir() {
+    std::wstring cur = g_cfg.tempDir.empty() ? DefaultTempDir() : g_cfg.tempDir;
+    std::wstring picked;
+
+    // 与「另存为」同样的处理：临时固定态面板是 TOPMOST，会压住系统对话框
+    bool wasTop = g_pinned && g_panel;
+    if (wasTop) SetWindowPos(g_panel, HWND_NOTOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    g_dialogOpen = true;      // 对话框是模态的，期间禁止「失焦即隐藏」
+    bool ok = PickFolder(g_panel, cur, picked);
+    g_dialogOpen = false;
+    if (wasTop) SetWindowPos(g_panel, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!ok || picked.empty()) return;
+
+    // 换目录等于换历史库的位置：先把旧目录的数据取过来，再整体落一次盘。
+    // 不这么做的话，用户改一次临时目录就会看到「历史全没了」——那是最容易被
+    // 当成 bug 的体验，而实际数据一直躺在旧目录里。
+    std::wstring oldHist = HistoryDir();
+    g_cfg.tempDir = picked;
+    SettingsSave();
+    // 立刻验证一次：目录建不出来（无权限/盘符不存在）就退回默认并提示，
+    // 不要让采集在接下来的每次复制里都失败一次。
+    if (TempDir() != picked) {
+        Toast(L"该目录不可写，已退回默认临时目录", true);
+    } else {
+        Toast(L"临时目录已更改", true);
+    }
+    HistoryMigrateFrom(oldHist);
+    HistoryFlush();
+    Redraw();
 }

@@ -28,10 +28,14 @@ using namespace wv;
 // 惰性构建 + 缓存：it.thumb 一旦赋值就不再重试（失败永远是空位图，不会每帧重解码）
 Thumb* GetThumb(ClipItem& it) {
     if (it.thumb) return it.thumb.get();
-    if (it.kind != 2 || it.bits.empty() || !g_rt) return nullptr;
+    if (it.kind != 2 || !g_rt) return nullptr;
 
     ThumbRef t = std::make_shared<Thumb>();
     it.thumb = t;
+
+    // 先挂上空的 Thumb 再取内容：像素可能要从未命中的临时文件读回，
+    // 失败时保持空位图，不会每帧重试一遍。
+    if (!EnsureItemBits(it)) return t.get();
 
     Rgba src;
     bool ok = it.isPng ? PngToRgba(it.bits, src) : DibToRgba(it.bits, src);

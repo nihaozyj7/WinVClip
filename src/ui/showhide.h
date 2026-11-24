@@ -42,3 +42,12 @@ void ForceForeground(HWND hwnd);
 
 // 还原调用前的控件级焦点（SetForegroundWindow 只还原顶层窗口）
 void RestoreTargetFocus(HWND target, HWND focus);
+
+// 面板隐藏期间的闲置回收。分两档（见 app_state.h 的 IDLE_RELEASE_MS 注释）：
+//   · 每次闲置到点先 trim 工作集：任务管理器里看到的「内存」就是工作集，
+//     被换出的私有页进了 standby，物理内存真的还给了系统，且随时能零成本换回来；
+//   · 连续闲置很久（30 分钟）才连 emoji 图集一起放掉——那时用户多半已经离开，
+//     再进表情页重新读盘付 ~200ms 可以接受。
+// 注意**不释放主线程的 D2D 设备**：重建实测要 60ms，那正好压在「按 Win+V 到面板出现」
+// 这条热路径上，宁可让它的私有页留在 standby 里也不要付这个延迟。
+void ReleaseIdleMemory();

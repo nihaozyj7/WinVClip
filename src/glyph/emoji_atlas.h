@@ -16,6 +16,9 @@
 // 线程约束：
 //   工作线程自带一套 D2D/DWrite 设备（COM 的 D2D 设备不能跨线程共享），
 //   atlas 位图本身只由 UI 线程上传与使用，worker 只交出像素，不碰 D2D 位图。
+//   「每套设备 = 一块 25~32MB 的非缓冲私有池」是这里最贵的资源，所以：
+//     · 只开 1 个 worker；
+//     · 活全干完（预热 + 落盘）就 StopEmojiWorker 把设备还给系统，需要时 EnsureEmojiWorker 再拉起来。
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,6 +52,10 @@ bool EnsureEmojiCache(int sz);
 
 // 启动/恢复后台预热线程
 void StartEmojiWarm();
+
+// 光栅化 worker 在活干完后会自行退出（归还它那套 D2D 设备），
+// 有新字形要渲染时靠这个把它拉回来
+void EnsureEmojiWorker();
 
 // UI 定时器驱动：把 worker 交回的像素上传进 atlas，返回是否还有工作在途
 bool PumpEmojiUploads();

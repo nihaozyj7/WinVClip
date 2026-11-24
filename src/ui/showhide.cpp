@@ -10,11 +10,14 @@
 #include "core/diag.h"   // Trace
 #include "core/theme.h"
 #include "core/util.h"          // S
+#include "glyph/emoji_atlas.h"  // ReleaseEmojiCache（闲置回收）
 #include "model/clip_model.h"    // BuildView
+#include "render/fonts.h"       // EnsureD2D
 #include "ui/actions.h"         // Toast
 #include "ui/caret.h"           // ProbeCaret / CaretInfo / BoxSaneRect
 #include "ui/layout.h"          // L / ComputeLayout / Redraw
 #include "ui/panel.h"
+#include "ui/settings_win.h"    // 设置窗口与面板互斥（ShowPanel 的第一件事）
 
 using namespace wv;
 
@@ -82,19 +85,20 @@ void RoundCorners(HWND hwnd) {
 void HidePanel() {
     Trace("HidePanel() from %p fg=%p", __builtin_return_address(0), (void*)GetForegroundWindow());
     bool noRestore = g_hideNoRestore;
-    g_hideNoRestore = false;
-    if (g_panel && IsWindowVisible(g_panel)) {
+    g_hideNoRestore = false;    if (g_panel && IsWindowVisible(g_panel)) {
         // 只有输入态（用户点过搜索框）面板才持有前台，那时收起必须把焦点还回原窗口，
         // 否则前台会停在一个不可见的窗口上：原窗口失焦、键盘输入毫无反应。
         // 非激活态下我们从没抢过焦点，什么都不用还。
         bool hadFocus = (GetForegroundWindow() == g_panel);
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }
         if (g_resizing) { g_resizing = RS_NONE; ReleaseCapture(); }
+        if (g_sbarDrag) { g_sbarDrag = false; ReleaseCapture(); }
         KillTimer(g_panel, TIMER_CARET);
         KillTimer(g_panel, TIMER_FOCUS);
         KillTimer(g_panel, TIMER_EMOJI);
         KillTimer(g_panel, TIMER_REPROBE);
         KillTimer(g_panel, TIMER_DEFERHIDE);
+    KillTimer(g_panel, TIMER_SCROLL);     // 滚动缓动别跟着窗口一起留在后台跑
         g_reprobeLeft = 0;
         ShowWindow(g_panel, SW_HIDE);
         // 面板收起后残留的「已吞 down」标记会让下一次显示吞掉一个孤立的 keyup。
@@ -113,6 +117,28 @@ void HidePanel() {
             RestoreTargetFocus(g_target, g_targetFocus);
         }
     }
+    // 收起之后开始计闲置：到点先把工作集 trim 掉（见 ReleaseIdleMemory 的说明）。
+    // 计时从「收起」起算而不是从启动起算，是因为用户连续使用时会不断重置它。
+    if (g_main) SetTimer(g_main, TIMER_IDLE, IDLE_RELEASE_MS, nullptr);
+}
+
+// 闲置回收：trim 工作集（随时），连闲置很久才放掉 emoji 图集。
+// 两档的理由见 showhide.h 的注释——核心是「唤出速度」这条热路径不许付重建代价。
+static int g_idleRounds = 0;
+enum { IDLE_HARD_ROUNDS = 20 };     // 20 × 90s ≈ 30 分钟
+
+void ReleaseIdleMemory() {
+    if (g_panel && IsWindowVisible(g_panel)) { g_idleRounds = 0; return; }
+    if (SettingsWindowVisible()) { g_idleRounds = 0; return; }   // 设置窗口也在用同一套设备
+    if (++g_idleRounds >= IDLE_HARD_ROUNDS) {
+        g_idleRounds = 0;
+        // 图集位图 19.5MB + 索引；磁盘缓存保留，下次进表情页直接读盘（~200ms）
+        ReleaseEmojiCache();
+    }
+    // 工作集清零：私有页进 standby，物理内存立刻可见地还回去。
+    // 注意这里**不碰任何对象**——面板下次显示只是把这些页换回来（软缺页，毫秒级），
+    // 不会重建 D2D 设备、不会重新光栅化字形。
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
 // ---- 诊断日志（默认关闭，声明见文件头部）----
@@ -194,8 +220,14 @@ void RestoreTargetFocus(HWND target, HWND focus) {
 
 void ShowPanel() {
     Trace("=== ShowPanel enter fg=%p vis=%d", (void*)GetForegroundWindow(), g_panel ? (int)IsWindowVisible(g_panel) : -1);
+    // 设置与面板互斥：设置是独立普通窗口，两个同时在场只会让人不知道该点哪个。
+    // 顺序要在「读前台当目标窗口」之前——设置窗口一旦是前台，g_target 会被记成它自己。
+    if (SettingsWindowVisible()) CloseSettingsWindow();
+    // 重新显示就重置闲置计时；D2D 设备只可能被释放过（当前策略下不会），顺手兜底
+    if (g_main) KillTimer(g_main, TIMER_IDLE);
+    EnsureD2D();
     g_query.clear(); g_comp.clear();
-    g_sel = 0; g_top = 0;
+    g_sel = 0; ResetListScroll();
     g_hoverRow = g_hoverChip = g_hoverCell = -1;
     g_gridScroll = 0;
     g_menuOpen = false;

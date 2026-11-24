@@ -1,7 +1,10 @@
 // clip_model.cpp —— 实现见 clip_model.h（那里写了三条不变式）。
 #include "model/clip_model.h"
 
+#include <algorithm>
+
 #include "core/app_state.h"    // g_items / g_view / g_sel / g_page / g_filter / g_query
+#include "core/history_store.h" // HistorySearchBodies（正文只在库里的条目）
 #include "core/text_util.h"    // Lower
 #include "glyph/glyph.h"       // GlyphCount / GlyphItems
 
@@ -29,12 +32,30 @@ void BuildView() {
     g_view.clear();
     std::wstring q = Lower(g_query);
     std::vector<int> tmp;
+    // 正文不在内存的条目（超长文本，见 core/history_store.h 的内存策略），
+    // 内存里比不出结果，收集起来交给数据库一次补查——一次 SQL 循环绑定，
+    // 而不是每条查一次。
+    std::vector<int> missDbIds, missIdx;
     for (int i = 0; i < (int)g_items.size(); ++i) {
         const ClipItem& it = g_items[i];
         if (g_page == PG_FAV && !it.fav) continue;
         if (!MatchFilter(it)) continue;
-        if (!MatchQuery(it, q)) continue;
-        tmp.push_back(i);
+        if (MatchQuery(it, q)) {
+            tmp.push_back(i);
+        } else if (!q.empty() && it.kind == 0 && it.text.empty() && it.dbId > 0) {
+            missDbIds.push_back(it.dbId);
+            missIdx.push_back(i);
+        }
+    }
+    if (!missDbIds.empty()) {
+        std::vector<int> hits;
+        HistorySearchBodies(missDbIds, q, hits);
+        for (int id : hits) {
+            for (size_t k = 0; k < missDbIds.size(); ++k) {
+                if (missDbIds[k] == id) { tmp.push_back(missIdx[k]); break; }
+            }
+        }
+        std::sort(tmp.begin(), tmp.end());   // 补查到的条目要回到它原本的时间顺序上
     }
     // 置顶优先（稳定排序：保持原相对顺序）
     for (int i : tmp) if (g_items[i].pinned) g_view.push_back(i);

@@ -38,6 +38,11 @@ extern const GUID kWicFmt32PBGRA;
 // 全量写入（分块，避免一次性大内存拷贝）
 bool WriteAllBytes(const std::wstring& path, const void* data, size_t n);
 
+// 全量读入（同样分块）。超过 maxBytes 直接失败——临时目录里的东西是本程序自己写的，
+// 尺寸失控说明文件被改坏了，宁可当作没有也不要一次吃进几个 G。
+bool ReadAllBytes(const std::wstring& path, std::vector<BYTE>& out,
+                  size_t maxBytes = 256u * 1024 * 1024);
+
 // 把 BGRA 缓冲编码成 PNG 落盘
 bool SaveRgbaAsPng(const Rgba& img, const std::wstring& path);
 

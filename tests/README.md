@@ -66,9 +66,11 @@ if __name__ == "__main__":
 
 | 现象 | 真凶 |
 |---|---|
+| `test_persist` 直接打印 SKIP | `settings.ini` 里 `admin=1`：管理员实例下普通权限的 `SendInput` 被 UIPI 挡，Win+V 到不了面板。跑前把 admin 改 0 并重启实例 |
 | 前台不是预期窗口 | 截图工具（`SnapCppOverlay`）残留覆盖窗；或 Edge 持有前台锁拒绝 `SetForegroundWindow` |
 | 读到的剪贴板/文本是别的东西 | 有多个记事本实例，用例操作的那个不是前台那个 |
 | `test_noactivate_keys` 历史页按 Enter 无反应 | 历史页为空（没有可粘的条目），基线上同样如此 |
+| `test_persist` 会重启程序、临时改 `settings.ini` 的 `tempdir` | 它验的就是「跨重启」「换目录」两件事；结束时会还原 `settings.ini`、删掉它造的历史，再把自己的实例拉起来 |
 | `test_glyph_insert` 记事本为空 | 本机 emoji 字体/前台时序问题，基线上同样为空 |
 | 面板截图拍到下层窗口 | 面板已失焦收起，或 `WS_EX_LAYERED` 抓不到：先 `test_pin_panel.py` 固定 |
 

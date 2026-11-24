@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/io_png.h"   // Rgba
+#include "core/model.h"    // ClipItem（EnsureItemBits）
 
 // PNG（CF_PNG）经 WIC 解码成 BGRA。有 64M 像素上限，挡住解压炸弹。
 bool PngToRgba(const std::vector<BYTE>& png, wv::Rgba& out);
@@ -38,3 +39,8 @@ void ReadPngSize(const std::vector<BYTE>& b, int& w, int& h);
 
 // 逐字节比较两份位图（剪贴板重复内容去重）
 bool SameBits(const std::vector<BYTE>& a, const std::vector<BYTE>& b);
+
+// 图片条目的像素副本会落到临时目录（见 clipboard/capture.cpp 的内存预算说明），
+// 内存里可能已经空了。任何「要用真内容」的地方（缩略图、写回剪贴板、另存为）
+// 先调它把 bits 读回来。返回 bits 是否可用。
+bool EnsureItemBits(ClipItem& it);

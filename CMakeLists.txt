@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
-project(winvclip CXX)
+# 需要 C：vendored 的 sqlite3.c（third_party）是纯 C 源文件
+project(winvclip C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,10 +21,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(WINVCLIP_SOURCES
     src/app/main.cpp
     src/app/hook.cpp
+    src/app/startup.cpp
     src/app/tray.cpp
     src/core/app_state.cpp
     src/core/diag.cpp
+    src/core/history_store.cpp
     src/core/io_png.cpp
+    src/core/settings.cpp
     src/core/text_measure.cpp
     src/core/text_util.cpp
     src/core/util.cpp
@@ -41,9 +45,14 @@ set(WINVCLIP_SOURCES
     src/ui/caret.cpp
     src/ui/actions.cpp
     src/ui/panel.cpp
+    src/ui/settings_win.cpp
     src/ui/showhide.cpp
     src/glyph/glyph.cpp
     src/glyph/glyph_data.cpp
+    # vendored 的 SQLite amalgamation（公共领域，单文件无外部依赖）。
+    # 历史持久化用它：页级读写，正文/图片尺寸交给数据库自己处理，
+    # 不像原先的 history.dat 那样每次改动都要全量重写。
+    third_party/sqlite3.c
 )
 
 # 程序图标：源 icon 在 resources/app.ico（由 tools/make_icon.py 从 assets/app.png 生成），
@@ -74,10 +83,19 @@ add_custom_command(TARGET winvclip POST_BUILD
 # 没有任何编译产物过期（"no work to do"），exe 里还是旧图标。
 set_property(TARGET winvclip APPEND PROPERTY LINK_DEPENDS ${WINVCLIP_RES_ICO})
 
-target_include_directories(winvclip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# 第三方源码不跟着吃本项目的 -Wall -Wextra：sqlite3.c 会喷出几千条警告，
+# 把真正需要看的警告淹掉。其余三个宏是本项目需要的裁剪：
+#   THREADSAFE=0          所有数据库访问都在 UI 主线程（没有后台写线程），不需要互斥；
+#   OMIT_LOAD_EXTENSION   不加载任何扩展，去掉一条不必要的攻击面；
+#   DQS=0                 禁止用双引号当字符串字面量，避免 SQL 里悄悄写错的引号被放过。
+set_source_files_properties(third_party/sqlite3.c PROPERTIES
+    COMPILE_OPTIONS "-w"
+    COMPILE_DEFINITIONS "SQLITE_THREADSAFE=0;SQLITE_OMIT_LOAD_EXTENSION;SQLITE_DQS=0")
+
+target_include_directories(winvclip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 target_link_libraries(winvclip PRIVATE
-    user32 gdi32 shell32 dwmapi d2d1 dwrite ole32 windowscodecs comdlg32 imm32 uiautomationcore)
+    user32 gdi32 shell32 dwmapi d2d1 dwrite ole32 oleaut32 windowscodecs comdlg32 imm32 uiautomationcore)
 
 target_compile_options(winvclip PRIVATE -Wall -Wextra -O2 -municode)
 target_link_options(winvclip PRIVATE -municode)
