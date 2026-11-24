@@ -46,10 +46,18 @@ build\winvclip.exe            :: 常驻托盘，按 Win+V 弹面板
 build\winvclip.exe --show     :: 启动后立刻弹一次（调试用）
 ```
 
-发布用的单文件 exe 要额外打开静态运行时，否则发到没装 MSYS2 的机器会缺 `libstdc++-6.dll`：
+默认就是静态链接的：编出来的 `build\winvclip.exe` 是单个文件，只依赖系统 DLL
+（`user32`/`d2d1`/`ucrtbase` 这些 Win10 自带的），直接拷到没装 MinGW 的机器上双击即可运行。
+需要动态版（体积小些、gdb 符号好找）时显式关掉：
 
 ```bat
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DWINVCLIP_STATIC_RUNTIME=ON -DWINVCLIP_VERSION=1.2.3
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DWINVCLIP_STATIC_RUNTIME=OFF
+```
+
+发布时额外注入版本号（进 exe 的 VERSIONINFO，右键属性可见）：
+
+```bat
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DWINVCLIP_VERSION=1.2.3
 ```
 
 `-municode` 必须同时出现在编译和链接选项里，否则链接期找不到 `WinMain`。
@@ -63,6 +71,7 @@ cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DWINVCLIP_STATIC_RUNTIME=ON 
 
 正式版本见 [Releases](https://github.com/nihaozyj7/WinVClip/releases)：下 `WinVClip-<版本>-win64.zip`
 （或单个 `WinVClip-<版本>.exe`），解压双击即可，静态链接、不需要 .NET 或任何运行库。
+系统要求 Windows 10 及以上（依赖 UCRT、Direct2D、DirectWrite，均为系统自带组件）。
 
 发布是全自动的，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 完成：
 推 `v*` tag 或在 Actions 页面手动 Run workflow（填版本号）→ 用 MSYS2 的 MinGW-w64 构建 →

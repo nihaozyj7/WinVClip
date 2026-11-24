@@ -11,9 +11,12 @@ set(WINVCLIP_VERSION "${PROJECT_VERSION}" CACHE STRING "程序版本号（发布
 # VERSIONINFO 要求逗号分隔的 2~4 段整数：1.0.0 -> 1,0,0（不足 4 段不补齐，Windows 接受）
 string(REPLACE "." "," WINVCLIP_FILEVERSION "${WINVCLIP_VERSION}")
 
-# 发布用：静态链接 MinGW 运行时（libstdc++ / libgcc / libwinpthread），产出单个无需附带 dll 的
-# exe。默认关，本机构建保持原样；CI 里显式 -DWINVCLIP_STATIC_RUNTIME=ON。
-option(WINVCLIP_STATIC_RUNTIME "静态链接 MinGW 运行时（发布用单文件 exe）" OFF)
+# 静态链接 MinGW 运行时（libstdc++ / libgcc / libwinpthread），产出单个无需附带 dll 的 exe。
+# 默认 ON：随手编出来的 exe 就该能直接拷到没装 MinGW 的机器上跑，否则发出去必然缺
+# libstdc++-6.dll 打不开（动态版只在要减小体积/调 gdb 时才 -DWINVCLIP_STATIC_RUNTIME=OFF）。
+# 注意这是 CACHE 变量：早先 configure 过的构建目录里存的是旧值，改这里不会自动生效，
+# 需要在构建目录执行 cmake -DWINVCLIP_STATIC_RUNTIME=ON . 或删掉缓存重新 configure。
+option(WINVCLIP_STATIC_RUNTIME "静态链接 MinGW 运行时（发布用单文件 exe）" ON)
 
 # attach_icon.py 需要 python：CI 上 PATH 里的解释器名不一定是 python，交给 CMake 定位成绝对路径。
 # 找不到时退回裸名 python，本机行为不变。
