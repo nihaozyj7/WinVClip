@@ -7,9 +7,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 版本号：默认取 project() 的 VERSION，发布流水线用 -DWINVCLIP_VERSION=1.2.3 覆盖（取自 git tag）。
 # 它只进 exe 的 VERSIONINFO 资源（右键属性可见），不参与任何逻辑判断。
+# 允许带预发布后缀（如 2026.11.24-Beta.1），后缀只进字符串资源；数值部分另有约束，见下。
 set(WINVCLIP_VERSION "${PROJECT_VERSION}" CACHE STRING "程序版本号（发布时由 tag 注入）")
-# VERSIONINFO 要求逗号分隔的 2~4 段整数：1.0.0 -> 1,0,0（不足 4 段不补齐，Windows 接受）
-string(REPLACE "." "," WINVCLIP_FILEVERSION "${WINVCLIP_VERSION}")
+
+# FILEVERSION 的取值：VERSIONINFO 要求逗号分隔的 2~4 段整数（1.0.0 -> 1,0,0，不足 4 段不补齐，
+# Windows 接受），所以必须先剥掉预发布后缀再替换点号。直接 string(REPLACE) 全文替换会连
+# "-Beta.1" 里的点一起变成逗号，windres 编译 .rc 时会因非法整数字面量直接失败。
+string(REGEX REPLACE "^[vV]" "" _wv_clean "${WINVCLIP_VERSION}")
+string(REGEX MATCH "^[0-9]+(\\.[0-9]+)*" WINVCLIP_VERSION_NUMERIC "${_wv_clean}")
+if(NOT WINVCLIP_VERSION_NUMERIC)
+  message(FATAL_ERROR "版本号必须由数字开头，收到：${WINVCLIP_VERSION}")
+endif()
+string(REPLACE "." ";" _wv_parts "${WINVCLIP_VERSION_NUMERIC}")
+list(LENGTH _wv_parts _wv_count)
+if(_wv_count GREATER 4)
+  message(FATAL_ERROR "版本号数值部分最多 4 段（VERSIONINFO 的 FILEVERSION 限制），收到：${WINVCLIP_VERSION}")
+endif()
+string(REPLACE "." "," WINVCLIP_FILEVERSION "${WINVCLIP_VERSION_NUMERIC}")
 
 # 静态链接 MinGW 运行时（libstdc++ / libgcc / libwinpthread），产出单个无需附带 dll 的 exe。
 # 默认 ON：随手编出来的 exe 就该能直接拷到没装 MinGW 的机器上跑，否则发出去必然缺

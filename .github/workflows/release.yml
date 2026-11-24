@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号，如 1.0.0 或 v1.0.0（tag 不存在时在当前提交上创建）"
+        description: "版本号，如 1.0.0 / 2026.11.24-Beta.1（可带 v 前缀；tag 不存在时在当前提交上创建）"
         required: true
         type: string
       dry_run:
@@ -61,14 +61,20 @@ jobs:
           if (-not $raw) { throw "版本号为空（workflow_dispatch 需要填 version）" }
           if ($raw -notmatch '^v') { $raw = "v$raw" }
           $num = $raw -replace '^v', ''
-          # 只允许数字点分：VERSIONINFO 的 FILEVERSION 必须是逗号分隔整数，
-          # 且 tag 里带斜杠/空格会污染后续的文件名。
-          if ($num -notmatch '^\d+\.\d+(\.\d+)?$') {
-            throw "版本号需形如 1.2 或 1.2.3，收到：$num"
+          # 形态：数字点分段 + 可选的预发布后缀（-Beta.1 / -rc2）。为什么限制这么死：
+          #   · VERSIONINFO 的 FILEVERSION 必须是逗号分隔整数，后缀带不进二进制（CMake 侧会剥掉）；
+          #   · 后缀里的点、加号会污染 zip/exe 的文件名；
+          #   · 带斜杠会被当成 tag 的层级名。
+          if ($num -notmatch '^\d+(\.\d+)*(-[0-9A-Za-z][0-9A-Za-z.]*)?$') {
+            throw "版本号需形如 1.2 / 1.2.3 / 2026.11.24-Beta.1，收到：$num"
           }
+          # 预发布：后缀存在即视为 Beta/RC，发布时标成 pre-release（不进「Latest」，
+          # 也不会被当成正式版推给所有人）。GitHub 的 prerelease 输入是布尔，故直接出布尔串。
+          $pre = if ($num -match '-') { 'true' } else { 'false' }
           "tag=$raw" >> $env:GITHUB_OUTPUT
           "num=$num" >> $env:GITHUB_OUTPUT
-          Write-Host "tag=$raw num=$num"
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          Write-Host "tag=$raw num=$num prerelease=$pre"
 
       - name: 安装 MinGW-w64 工具链
         uses: msys2/setup-msys2@v2
@@ -170,6 +176,8 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: WinVClip ${{ steps.ver.outputs.tag }}
+          # 版本号带后缀（Beta/RC）时标成 pre-release：不进「Latest」，避免被当成稳定版推给所有人。
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           # workflow_dispatch 手动触发时 tag 可能还不存在，用它指定在哪个提交上创建。
           target_commitish: ${{ github.sha }}
           draft: false
@@ -178,6 +186,7 @@ jobs:
             ## WinVClip ${{ steps.ver.outputs.tag }}
 
             Windows 剪贴板历史面板：按 `Win+V` 弹出，替代系统剪贴板历史。
+            ${{ steps.ver.outputs.prerelease == 'true' && '**这是预发布版本（Beta/RC），可能仍有问题，请阅读下方说明后再用。**' || '' }}
 
             **下载 `WinVClip-${{ steps.ver.outputs.num }}-win64.zip`（或直接下 `.exe`）**，解压后双击运行，
             常驻托盘，无需安装、不写注册表、不需要 .NET 或运行库。

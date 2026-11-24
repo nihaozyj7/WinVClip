@@ -3,7 +3,7 @@ rem release.bat --- 一键发布：检查工作树 -> 打 tag -> 推送，触发 GitHub Actions 
 rem
 rem 用法（在仓库根目录）：
 rem     tools\release.bat 1.0.0
-rem     tools\release.bat 1.1.0-beta    （带后缀会发布成 pre-release，需在页面上手动标记）
+rem     tools\release.bat 2026.11.24-Beta.1    （带后缀自动发布成 pre-release）
 rem
 rem 上线的是 tag，不是当前分支：工作树必须干净，否则打出的 tag 里缺少你刚改的东西。
 rem 构建、校验、上传全部在 CI 里做（见 .github/workflows/release.yml），本机不编译。
@@ -13,10 +13,10 @@ set "VER=%~1"
 if "%VER%"=="" goto usage
 rem 去掉可能带上的 v 前缀，统一成 vX.Y.Z
 if /i "%VER:~0,1%"=="v" set "VER=%VER:~1%"
-rem 只做宽松校验（数字与点），严格格式（1.2 / 1.2.3）由 CI 判：不合法会在构建前中止，不会发出脏 Release。
-echo %VER%| findstr /r "^[0-9][0-9.]*$" >nul
+rem 只做字符集级校验（数字/点/字母/连字符），精确形态（1.2.3 / 2026.11.24-Beta.1）由 CI 判：findstr 只有基本正则，不支持分组和 ?，可选后缀在这里表达不出来，写死在批处理里只会误拒。
+echo %VER%| findstr /r "^[0-9][0-9.A-Za-z-]*$" >nul
 if errorlevel 1 (
-    echo [x] 版本号格式不对：只能含数字和点，如 1.0.0，收到 "%VER%"
+    echo [x] 版本号格式不对：只能含数字和点（可带 -Beta.1 这类后缀），如 1.0.0，收到 "%VER%"
     exit /b 1
 )
 
