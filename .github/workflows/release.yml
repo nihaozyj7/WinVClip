@@ -182,6 +182,14 @@ jobs:
           target_commitish: ${{ github.sha }}
           draft: false
           generate_release_notes: true
+          # 必须显式列 files：softprops 不传 files 时只创建 Release、不上传任何附件，也
+          # 不报错——表现是「流水线全绿但 Release 页面下载不到东西」（2026.11.24-Beta.1
+          # 首次正式发布就踩到了）。fail_on_unmatched_files 让漏文件时直接失败而不是静默通过。
+          files: |
+            WinVClip-*.zip
+            WinVClip-*.exe
+            WinVClip-*.sha256
+          fail_on_unmatched_files: true
           body: |
             ## WinVClip ${{ steps.ver.outputs.tag }}
 
