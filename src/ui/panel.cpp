@@ -474,9 +474,11 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         } else if (wp == TIMER_EMOJI) {
             KillTimer(hwnd, TIMER_EMOJI);
-            // 预热/补齐都要推进，哪怕面板此刻不在表情页、甚至不可见
-            bool more = PumpEmojiUploads();
-            if (g_page == PG_EMOJI) Redraw(&L.body);
+            // 预热/补齐都要推进，哪怕面板此刻不在表情页、甚至不可见；
+            // 但只有真上传了新格子才重绘——否则预热那 3 秒里会以 125Hz 全帧重绘。
+            int uploaded = 0;
+            bool more = PumpEmojiUploads(&uploaded);
+            if (uploaded > 0 && g_page == PG_EMOJI) Redraw(&L.body);
             if (more) SetTimer(hwnd, TIMER_EMOJI, 8, nullptr);
         } else if (wp == TIMER_REPROBE) {
             // 补探测：首轮没拿到插入符时的第二次机会。用户动过面板就不再挪。
@@ -809,6 +811,17 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_menuOpen = true;
                     g_menuRow = i;
                     g_menuItem = g_view[g_top + i];
+                    // 记下这一条的身份：菜单开着的时候剪贴板可能变化（新条目插到最前），
+                    // 那样 g_menuItem 这个下标就指向别人了，执行前必须重新核对。
+                    if (g_menuItem >= 0 && g_menuItem < (int)g_items.size()) {
+                        g_menuDbId = g_items[g_menuItem].dbId;
+                        g_menuSt = g_items[g_menuItem].st;
+                        g_menuTitle = g_items[g_menuItem].title;
+                    } else {
+                        g_menuDbId = -1;
+                        g_menuSt = SYSTEMTIME{};
+                        g_menuTitle.clear();
+                    }
                     g_menuHover = -1;
                     Redraw();
                     return 0;

@@ -285,6 +285,19 @@ void SaveItemAs(int idx) {
 void RunMenuItem(int hit) {
     int row = g_menuRow, item = g_menuItem;
     g_menuOpen = false;
+    // 菜单开着期间 g_items 可能被整体移动（新复制一条、或历史裁剪）：下标已经不可信。
+    // 用呼出时记下的身份核对一次，对不上就什么都不做——「删错了别的条目」是不可撤销的。
+    bool stale = (item < 0 || item >= (int)g_items.size() ||
+                  g_items[item].dbId != g_menuDbId ||
+                  memcmp(&g_items[item].st, &g_menuSt, sizeof(SYSTEMTIME)) != 0 ||
+                  g_items[item].title != g_menuTitle);
+    if (stale) {
+        Toast(L"列表已变化，请重新选择", true);
+        BuildView();
+        ComputeLayout();
+        Redraw();
+        return;
+    }
     switch (hit) {
     case MI_PIN:  TogglePinItem(item); break;
     case MI_SAVE: SaveItemAs(item); break;

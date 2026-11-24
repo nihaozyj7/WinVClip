@@ -1,9 +1,28 @@
 cmake_minimum_required(VERSION 3.15)
 # 需要 C：vendored 的 sqlite3.c（third_party）是纯 C 源文件
-project(winvclip C CXX)
+project(winvclip VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 版本号：默认取 project() 的 VERSION，发布流水线用 -DWINVCLIP_VERSION=1.2.3 覆盖（取自 git tag）。
+# 它只进 exe 的 VERSIONINFO 资源（右键属性可见），不参与任何逻辑判断。
+set(WINVCLIP_VERSION "${PROJECT_VERSION}" CACHE STRING "程序版本号（发布时由 tag 注入）")
+# VERSIONINFO 要求逗号分隔的 2~4 段整数：1.0.0 -> 1,0,0（不足 4 段不补齐，Windows 接受）
+string(REPLACE "." "," WINVCLIP_FILEVERSION "${WINVCLIP_VERSION}")
+
+# 发布用：静态链接 MinGW 运行时（libstdc++ / libgcc / libwinpthread），产出单个无需附带 dll 的
+# exe。默认关，本机构建保持原样；CI 里显式 -DWINVCLIP_STATIC_RUNTIME=ON。
+option(WINVCLIP_STATIC_RUNTIME "静态链接 MinGW 运行时（发布用单文件 exe）" OFF)
+
+# attach_icon.py 需要 python：CI 上 PATH 里的解释器名不一定是 python，交给 CMake 定位成绝对路径。
+# 找不到时退回裸名 python，本机行为不变。
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    set(WINVCLIP_PYTHON "${Python3_EXECUTABLE}")
+else()
+    set(WINVCLIP_PYTHON "python")
+endif()
 
 # 目录结构与依赖方向（单向，下层不得反向 include 上层）：
 #
@@ -75,7 +94,7 @@ add_executable(winvclip WIN32 ${WINVCLIP_SOURCES})
 add_custom_command(TARGET winvclip POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${WINVCLIP_RES_ICO} ${CMAKE_CURRENT_BINARY_DIR}/app.ico
     COMMAND windres -O coff -o app_icon.obj app.rc
-    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/tools/attach_icon.py winvclip.exe app_icon.obj
+    COMMAND ${WINVCLIP_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/attach_icon.py winvclip.exe app_icon.obj
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "贴上程序图标资源")
 
@@ -99,3 +118,14 @@ target_link_libraries(winvclip PRIVATE
 
 target_compile_options(winvclip PRIVATE -Wall -Wextra -O2 -municode)
 target_link_options(winvclip PRIVATE -municode)
+
+# 发布产物：把 MinGW 运行时也静态链进去，否则用户没装 MSYS2 会缺 libstdc++-6.dll 打不开。
+# 系统 dll（user32/d2d1/…）仍是动态导入，这个选项不影响它们。
+if(WINVCLIP_STATIC_RUNTIME)
+    target_link_options(winvclip PRIVATE -static)
+endif()
+
+# 版本号注入 .rc（VERSIONINFO）：configure_file 在 configure 期展开，
+# 换版本号后必须重新 configure（CI 是全新构建目录，无影响）。
+# 提示文字用 ASCII：CI 与本机的控制台代码页不同，中文会显示成乱码。
+message(STATUS "WinVClip version: ${WINVCLIP_VERSION} (static runtime: ${WINVCLIP_STATIC_RUNTIME})")

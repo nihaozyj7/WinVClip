@@ -9,3 +9,41 @@
 //      在链接后由 tools/attach_icon.py 贴上（原因见该脚本注释：ld 2.47 合并 icon 会失败）。
 //      数字需与 src/app/resource.h 里的 IDI_APP 保持一致。
 101 ICON "app.ico"
+
+// VERSIONINFO：资源管理器「属性 → 详细信息」里的版本信息，也是发布流水线校验
+// 「打出来的 exe 是不是 tag 对应的版本」的唯一依据（CI 读 FileVersion 比对）。
+//
+// 几条约束：
+//   1. 值全部来自 CMake 的 @VAR@ 替换，不在这里写死版本，否则 tag 和 exe 会脱钩；
+//   2. 字符串一律 ASCII：windres 按本地代码页（GBK）解析 .rc 里的字面量，写中文在
+//      CI（英语代码页）与本机（GBK）之间会变乱码；
+//   3. FILEVERSION/PRODUCTVERSION 必须是逗号分隔的整数，版本号里的 -beta 之类后缀
+//      已在 CMake/CI 侧剥掉，不会到这里。
+1 VERSIONINFO
+FILEVERSION @WINVCLIP_FILEVERSION@
+PRODUCTVERSION @WINVCLIP_FILEVERSION@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "WinVClip"
+            VALUE "FileDescription", "WinVClip - clipboard history panel"
+            VALUE "FileVersion", "@WINVCLIP_VERSION@"
+            VALUE "InternalName", "winvclip"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "winvclip.exe"
+            VALUE "ProductName", "WinVClip"
+            VALUE "ProductVersion", "@WINVCLIP_VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

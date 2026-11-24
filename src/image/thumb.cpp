@@ -10,7 +10,7 @@
 #include "core/app_state.h"    // g_rt / g_brush
 #include "core/theme.h"        // C_SUBTLE / C_LINE
 #include "core/util.h"         // S
-#include "image/raster.h"      // PngToRgba / DibToRgba / BoxDownsample / MakeCompatBitmap
+#include "image/raster.h"      // PngToThumb / DibToThumb / MakeCompatBitmap
 #include "render/dc.h"         // Brush
 
 using namespace wv;
@@ -38,17 +38,15 @@ Thumb* GetThumb(ClipItem& it) {
     if (!EnsureItemBits(it)) return t.get();
 
     Rgba src;
-    bool ok = it.isPng ? PngToRgba(it.bits, src) : DibToRgba(it.bits, src);
-    if (!ok) return t.get();
+    // box 尺寸要在解码前就知道：WIC 的 scaler / StretchDIBits 都按它直接出像素，
+    // 于是这一条路径上不会出现「整张 6000×4000 的全尺寸 BGRA」那种临时缓冲。
+    const int box = S(36);
+    bool ok = it.isPng ? PngToThumb(it.bits, box, src) : DibToThumb(it.bits, box, src);
+    if (!ok || src.w <= 0 || src.h <= 0) return t.get();
 
-    int box = S(36);
-    double sc = (std::min)((double)box / src.w, (double)box / src.h);
-    int tw = (std::max)(1, (int)lround(src.w * sc));
-    int th = (std::max)(1, (int)lround(src.h * sc));
-
+    int tw = src.w, th = src.h;
     std::vector<BYTE> small;
-    BoxDownsample(src, tw, th, small);
-    std::vector<BYTE>().swap(src.px);                // 原图缓冲立刻还回去，别和缩略图一起占着
+    small.swap(src.px);                              // 已经是缩略图尺寸，不需要再降采样
 
     // 圆角 + 预乘
     float rad = (float)S(6) * (float)tw / (float)box;

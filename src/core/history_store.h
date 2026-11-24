@@ -61,6 +61,10 @@ void HistoryTouch();
 // 立刻提交（防抖定时器到点、退出、RelaunchElevated 之前）
 void HistoryFlush();
 
+// 上一次 HistoryFlush 是否失败（成功后会清掉）。失败时条目仍留在内存里、功能照常，
+// 只是没落盘：UI 侧据此给一次可见提示，别让「历史突然一天比一天少」毫无线索。
+bool HistoryFlushFailed();
+
 // 用户改了「临时文件目录」：把旧目录里的数据库取到新目录来，
 // 免得改一次设置就跟历史说了再见。oldDir 传改之前 HistoryDir() 的值。
 void HistoryMigrateFrom(const std::wstring& oldDir);

@@ -42,9 +42,11 @@ void PutToClipboard(const ClipItem& itIn) {
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (h) {
             void* p = GlobalLock(h);
-            memcpy(p, it.text.c_str(), bytes);
-            GlobalUnlock(h);
-            if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+            if (p) {
+                memcpy(p, it.text.c_str(), bytes);
+                GlobalUnlock(h);
+            }
+            if (!p || !SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
         }
     } else if (it.kind == 1) {
         size_t chrs = 1;
@@ -53,6 +55,7 @@ void PutToClipboard(const ClipItem& itIn) {
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
         if (h) {
             auto* df = (DROPFILES*)GlobalLock(h);
+            if (!df) { GlobalFree(h); CloseClipboard(); return; }
             df->pFiles = sizeof(DROPFILES);
             df->fWide = TRUE;
             auto* p = (wchar_t*)((BYTE*)df + sizeof(DROPFILES));
@@ -69,9 +72,11 @@ void PutToClipboard(const ClipItem& itIn) {
         HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, it.bits.size());
         if (h) {
             void* p = GlobalLock(h);
-            memcpy(p, it.bits.data(), it.bits.size());
-            GlobalUnlock(h);
-            if (!SetClipboardData(fmt, h)) GlobalFree(h);
+            if (p) {
+                memcpy(p, it.bits.data(), it.bits.size());
+                GlobalUnlock(h);
+            }
+            if (!p || !SetClipboardData(fmt, h)) GlobalFree(h);
         }
     }
     CloseClipboard();
@@ -105,9 +110,11 @@ void PutText(const std::wstring& s) {
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
     if (h) {
         void* p = GlobalLock(h);
-        memcpy(p, s.c_str(), bytes);
-        GlobalUnlock(h);
-        if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+        if (p) {
+            memcpy(p, s.c_str(), bytes);
+            GlobalUnlock(h);
+        }
+        if (!p || !SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
     }
     CloseClipboard();
 }
@@ -171,9 +178,11 @@ void RestoreClipboard() {
             size_t bytes = (g_clipBak.text.size() + 1) * sizeof(wchar_t);
             if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
                 void* p = GlobalLock(h);
-                memcpy(p, g_clipBak.text.c_str(), bytes);
-                GlobalUnlock(h);
-                if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+                if (p) {
+                    memcpy(p, g_clipBak.text.c_str(), bytes);
+                    GlobalUnlock(h);
+                }
+                if (!p || !SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
             }
         } else if (!g_clipBak.files.empty()) {
             size_t chrs = 1;
@@ -181,6 +190,8 @@ void RestoreClipboard() {
             size_t total = sizeof(DROPFILES) + chrs * sizeof(wchar_t);
             if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total)) {
                 auto* df = (DROPFILES*)GlobalLock(h);
+                if (!df) { GlobalFree(h); }
+                else {
                 df->pFiles = sizeof(DROPFILES);
                 df->fWide = TRUE;
                 auto* p = (wchar_t*)((BYTE*)df + sizeof(DROPFILES));
@@ -191,20 +202,25 @@ void RestoreClipboard() {
                 *p = 0;
                 GlobalUnlock(h);
                 if (!SetClipboardData(CF_HDROP, h)) GlobalFree(h);
+                }
             }
         } else if (!g_clipBak.png.empty() && g_cfPng) {
             if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, g_clipBak.png.size())) {
                 void* p = GlobalLock(h);
-                memcpy(p, g_clipBak.png.data(), g_clipBak.png.size());
-                GlobalUnlock(h);
-                if (!SetClipboardData(g_cfPng, h)) GlobalFree(h);
+                if (p) {
+                    memcpy(p, g_clipBak.png.data(), g_clipBak.png.size());
+                    GlobalUnlock(h);
+                }
+                if (!p || !SetClipboardData(g_cfPng, h)) GlobalFree(h);
             }
         } else if (!g_clipBak.dib.empty()) {
             if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, g_clipBak.dib.size())) {
                 void* p = GlobalLock(h);
-                memcpy(p, g_clipBak.dib.data(), g_clipBak.dib.size());
-                GlobalUnlock(h);
-                if (!SetClipboardData(CF_DIB, h)) GlobalFree(h);
+                if (p) {
+                    memcpy(p, g_clipBak.dib.data(), g_clipBak.dib.size());
+                    GlobalUnlock(h);
+                }
+                if (!p || !SetClipboardData(CF_DIB, h)) GlobalFree(h);
             }
         }
         g_selfClipSeq = GetClipboardSequenceNumber();   // 还原动作本身也不该进历史

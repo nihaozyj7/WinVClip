@@ -46,12 +46,36 @@ build\winvclip.exe            :: 常驻托盘，按 Win+V 弹面板
 build\winvclip.exe --show     :: 启动后立刻弹一次（调试用）
 ```
 
+发布用的单文件 exe 要额外打开静态运行时，否则发到没装 MSYS2 的机器会缺 `libstdc++-6.dll`：
+
+```bat
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DWINVCLIP_STATIC_RUNTIME=ON -DWINVCLIP_VERSION=1.2.3
+```
+
 `-municode` 必须同时出现在编译和链接选项里，否则链接期找不到 `WinMain`。
 `src/glyph/glyph_data.cpp`（字形库，~840KB 字面量）已生成好并入库，日常编译不用管它；
 换 Unicode 数据时才用 `python tools/gen_glyph_data.py <参考数据目录> src` 重新生成。
 
 想开机自启：把 exe 的快捷方式丢进 `shell:startup`。单实例运行（互斥体 `WinVClip_SingleInstance`），
 不写任何注册表，托盘右键退出后系统剪贴板历史与 Win+V 立刻恢复原样。
+
+## 下载与发布
+
+正式版本见 [Releases](https://github.com/nihaozyj7/WinVClip/releases)：下 `WinVClip-<版本>-win64.zip`
+（或单个 `WinVClip-<版本>.exe`），解压双击即可，静态链接、不需要 .NET 或任何运行库。
+
+发布是全自动的，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 完成：
+推 `v*` tag 或在 Actions 页面手动 Run workflow（填版本号）→ 用 MSYS2 的 MinGW-w64 构建 →
+校验产物 → 建 Release。维护者一键发布：
+
+```bat
+tools\release.bat 1.0.0       :: 检查工作树干净 -> 打 tag -> 推送，剩下交给 Actions
+```
+
+CI 只做能自动判定的检查：exe 的 `VERSIONINFO` 必须等于 tag 版本、导入表里不许出现
+`libstdc++` / `libgcc` / `libwinpthread`（防静态链接被改回动态）、打包并生成 SHA-256。
+`tests/` 那套是真桌面交互回归（真窗口、钩子、剪贴板），runner 上没有可交互桌面，跑出来只会是假失败，
+所以**发布前请在本地跑 `python tests\run.py`**。
 
 ## 用法
 

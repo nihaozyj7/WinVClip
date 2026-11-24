@@ -117,10 +117,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_panel) SetTimer(g_panel, TIMER_EMOJI, 8, nullptr);
         } else if (wp == TIMER_CLIP) {
             KillTimer(hwnd, TIMER_CLIP);
-            CaptureClipboard();
-            BuildView();
-            ComputeLayout();
-            if (g_panel && IsWindowVisible(g_panel)) Redraw();
+            // 内容没变（同一份内容被复制两次、或剪贴板只是被清空）就不重建视图：
+            // BuildView + ComputeLayout + 整帧重绘在 500 条历史上是白花的几毫秒。
+            if (CaptureClipboard()) {
+                BuildView();
+                ComputeLayout();
+                if (g_panel && IsWindowVisible(g_panel)) Redraw();
+            }
         } else if (wp == TIMER_PASTE) {
             KillTimer(hwnd, TIMER_PASTE);
             HWND target = g_pasteTarget;
@@ -169,6 +172,30 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_PERSIST) {
             // 防抖落盘：连续复制十几条只写一次盘（见 core/history_store.h）
             KillTimer(hwnd, TIMER_PERSIST);
+            HistoryFlush();
+            // 落盘失败（库被别的进程锁住 / 目录只读）必须让用户看见一次，
+            // 否则表现是「这次复制的东西重启后就没了」，完全无从排查。
+            static bool s_notified = false;
+            if (HistoryFlushFailed()) {
+                if (!s_notified) {
+                    s_notified = true;
+                    Toast(L"历史保存失败：数据库被占用或不可写", true);
+                }
+            } else {
+                s_notified = false;
+            }
+        }
+        return 0;
+
+    // 注销 / 关机：防抖定时器等不到了，必须当场落盘，否则最后一次复制直接丢。
+    // 不阻塞太久（系统对 QUERYENDSESSION 有超时），一次同步事务是毫秒级的。
+    case WM_QUERYENDSESSION:
+        if (g_main) KillTimer(g_main, TIMER_PERSIST);
+        HistoryFlush();
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wp) {      // 真的要结束了：再试一次（第一次可能因锁失败）
+            if (g_main) KillTimer(g_main, TIMER_PERSIST);
             HistoryFlush();
         }
         return 0;
@@ -310,7 +337,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR cmdLine, int) {
     LoadViewSize();       // 上次调整好的面板尺寸
     HistoryLoad();        // 上一个会话的历史 + 最近使用的字形
     InitData();
-    ApplyHistoryLimit();  // 读过设置之后再按当前上限裁一次
+    // 读过设置之后再按当前上限裁一次。裁掉的行必须立刻落盘：用户把上限从 500 改到 50
+    // 是为了「马上省地方」，等下一次复制才生效的话，库里那 450 条会一直躺到下次采集。
+    {
+        size_t before = g_items.size();
+        ApplyHistoryLimit();
+        if (g_items.size() != before) HistoryTouch();
+    }
     BuildView();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     InitD2D();

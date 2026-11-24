@@ -646,12 +646,19 @@ static void PaintSegBtn(HDC dc, const RECT& r, const wchar_t* label, bool on, bo
 }
 
 // 左侧标签，超宽时自己截断（DWrite 的 trimming 在 TextOutF 里被关掉了，见 dc.cpp）
+// 截断用二分查找 + 不进缓存的度量：早先是「从尾部一个字符一个字符砍、每次都查全局
+// TextW 缓存」，一个 60 字符的临时目录路径就要往缓存里插几十条永不命中的中间串，
+// 几次重绘就把 600 条额度顶穿，连带把页签/chip 那些固定文案全清掉。
 static std::wstring EllipText(HFONT f, const std::wstring& s, int maxW) {
     if (maxW <= 0) return std::wstring();
-    if (TextW(f, s) <= maxW) return s;
-    std::wstring out = s;
-    while (!out.empty() && TextW(f, out + L"…") > maxW) out.pop_back();
-    return out + L"…";
+    if (TextW(f, s) <= maxW) return s;              // 常见情况：整串能放下，走缓存
+    size_t lo = 0, hi = s.size();                   // 找最大的 lo，使 prefix(lo)+… 放得下
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (TextWNoCache(f, s.substr(0, mid) + L"…") <= maxW) lo = mid;
+        else hi = mid - 1;
+    }
+    return s.substr(0, lo) + L"…";
 }
 
 void PaintSettings(HDC dc) {
@@ -924,7 +931,11 @@ void PaintPanel(HWND hwnd) {
     PaintEnd();
     LONGLONG t5 = g_perfOn ? PerfNow() : 0;
 
-    BitBlt(dc0, 0, 0, W, H, dc, 0, 0, SRCCOPY);
+    // 只把脏区贴回窗口：缓冲是复用的，脏区外的像素仍是上一帧内容。
+    // 整窗 BitBlt 在 560×620 上虽然只有 ~0.1ms，但滚动时每帧都做，而且
+    // DWM 侧要合成整个矩形——只贴脏区能省掉这部分。
+    BitBlt(dc0, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top,
+           dc, dirty.left, dirty.top, SRCCOPY);
     LONGLONG t6 = g_perfOn ? PerfNow() : 0;
 
     EndPaint(hwnd, &ps);

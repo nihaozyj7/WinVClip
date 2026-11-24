@@ -27,5 +27,9 @@ IDWriteTextFormat* Fmt(HFONT f);
 // 文字像素宽度（已缓存）
 int TextW(HFONT f, const std::wstring& s);
 
+// 文字像素宽度（**不进缓存**）。给「一次算几十个中间串」的场景用：
+// 每次调用都自己建一次 TextLayout，所以只适合单次会话里少量调用（如截断的二分查找）。
+int TextWNoCache(HFONT f, const std::wstring& s);
+
 // 字体环境变化后作废宽度缓存。
 void ClearTextWidthCache();

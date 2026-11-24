@@ -11,12 +11,12 @@
 using namespace wv;
 
 // ================================================================== 视图
+// q 已由调用方小写化（BuildView 里一次 Lower(g_query)），这里逐条做不分配内存的
+// 大小写不敏感查找：早先每条都 Lower() 四次，正文长的条目要拷几十 KB、拷两遍。
 bool MatchQuery(const ClipItem& it, const std::wstring& q) {
     if (q.empty()) return true;
-    return Lower(it.title).find(q) != std::wstring::npos ||
-           Lower(it.source).find(q) != std::wstring::npos ||
-           Lower(it.tag).find(q) != std::wstring::npos ||
-           Lower(it.text).find(q) != std::wstring::npos;
+    return ContainsCI(it.title, q) || ContainsCI(it.source, q) || ContainsCI(it.tag, q) ||
+           ContainsCI(it.text, q);
 }
 
 bool MatchFilter(const ClipItem& it) {

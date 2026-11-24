@@ -38,6 +38,8 @@ static int TextWUncached(HFONT f, const std::wstring& s) {
     return sz.cx;
 }
 
+int TextWNoCache(HFONT f, const std::wstring& s) { return TextWUncached(f, s); }
+
 int TextW(HFONT f, const std::wstring& s) {
     auto it = g_twCache.find(f);
     if (it != g_twCache.end()) {

@@ -26,8 +26,9 @@ void OnClipboardChanged();
 // 猜当前前台窗口的「来源」（浏览器、资源管理器…），用于条目上的元信息
 std::wstring ForegroundSource();
 
-// 真正读取剪贴板并写入历史（由延迟定时器触发）
-void CaptureClipboard();
+// 真正读取剪贴板并写入历史（由延迟定时器触发）。
+// 返回 true 表示历史发生了变化——调用方据此决定要不要重建视图/重绘。
+bool CaptureClipboard();
 
 // 历史上限（设置里可改）：按当前 g_cfg.historyLimit 裁掉最旧的条目。
 // 改设置后立刻调用一次，用户才看得见「500 条变成 200 条」的效果。

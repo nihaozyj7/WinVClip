@@ -4,6 +4,7 @@
 #include <string>
 
 #include "core/app_state.h"     // g_rt / g_brush / g_painting / g_ellipsis
+#include "core/diag.h"          // Trace（EndDraw 失败时留一行）
 #include "core/text_measure.h"  // Fmt：HFONT -> IDWriteTextFormat
 #include "core/util.h"          // S
 
@@ -50,7 +51,11 @@ void PaintEnd() {
     if (!g_painting) return;
     if (g_dirtyClip) { g_rt->PopAxisAlignedClip(); g_dirtyClip = false; }
     g_painting = false;
-    g_rt->EndDraw();
+    // 返回值不能丢：D2DERR_RECREATE_TARGET 表示设备丢了（显示驱动重置、显存压力），
+    // 之后的绘制都会画在无效目标上——不留下痕迹的话，用户看到的是「界面突然不刷新」，
+    // 而日志里什么都没有。默认不写文件（Trace 只在 WV_TRACE=1 时才写）。
+    HRESULT hr = g_rt->EndDraw();
+    if (FAILED(hr)) wv::Trace("  paint: enddraw hr=0x%x", (unsigned)hr);
 }
 
 void FillRound(HDC dc, const RECT& r, int rad, COLORREF fill, COLORREF border, int bw) {

@@ -5,8 +5,10 @@
 
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "core/app_state.h"    // g_main / g_items / g_recentEmo / g_recentSym / TIMER_PERSIST
+#include "core/diag.h"         // Trace
 #include "core/io_png.h"       // ReadAllBytes / WriteAllBytes
 #include "core/settings.h"     // TempDir / ConfigDir / HIST_MIN / HIST_MAX
 #include "core/text_util.h"    // W2U8 / FileNameOf
@@ -60,9 +62,17 @@ void WriteDirMark(const std::wstring& dir) {
 }
 
 // ================================================================== 数据库句柄
-void Exec(const char* sql) {
-    if (g_db) sqlite3_exec(g_db, sql, nullptr, nullptr, nullptr);
+// 返回值 = 「这条语句真的成功了」。所有调用方都必须看它：
+// 事务边界（BEGIN / COMMIT）一旦被静默吞掉，库就会退化成自动提交模式，
+// 于是「删掉旧的」单独提交成功、「写入新的」失败被忽略——中间态比整事务失败脏得多。
+bool Exec(const char* sql) {
+    if (!g_db) return false;
+    return sqlite3_exec(g_db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
 }
+
+// 上一次 HistoryFlush 是否失败（成功时清掉）。UI 侧据此给用户一次可见的提示：
+// 数据库打不开/被别的进程锁住时，历史是「照常能用、但不会落盘」，不能全静默。
+static bool g_flushFailed = false;
 
 // 把库的 WAL 合并回主文件。搬库/关库前必须做一次：只搬 history.db 而把 -wal
 // 丢掉，等于丢掉最后若干个**已提交**的事务（强杀后 -wal 里常有东西）。
@@ -149,6 +159,8 @@ bool OpenDb() {
     sqlite3* db = nullptr;
     if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
                         nullptr) != SQLITE_OK) {
+        // 打不开时留一行诊断：目录只读、被别的进程独占、盘符没了都会走到这里。
+        Trace("  db: open-failed err=%d", db ? sqlite3_errcode(db) : -1);
         sqlite3_close(db);
         return false;
     }
@@ -158,6 +170,7 @@ bool OpenDb() {
     Exec("PRAGMA journal_mode=WAL;");
     Exec("PRAGMA synchronous=NORMAL;");
     if (sqlite3_exec(g_db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        Trace("  db: schema-failed err=%d", sqlite3_errcode(g_db));
         CloseDb();
         return false;
     }
@@ -241,9 +254,9 @@ bool InsertItem(ClipItem& it) {
 }
 
 // 已有条目更新（只写元数据与标志位；正文见 kUpdateItem 的 ?17 说明）
-void UpdateItem(const ClipItem& it) {
+bool UpdateItem(const ClipItem& it) {
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(g_db, kUpdateItem, -1, &s, nullptr) != SQLITE_OK) return;
+    if (sqlite3_prepare_v2(g_db, kUpdateItem, -1, &s, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_int(s, 1, it.dbId);
     sqlite3_bind_int(s, 2, it.kind);
     BindSt(s, 3, it.st);
@@ -262,12 +275,13 @@ void UpdateItem(const ClipItem& it) {
     sqlite3_bind_int(s, 16, it.isLink ? 1 : 0);
     if (it.text.empty()) sqlite3_bind_null(s, 17);
     else BindText16(s, 17, it.text);
-    sqlite3_step(s);
+    bool ok = sqlite3_step(s) == SQLITE_DONE;
     sqlite3_finalize(s);
+    return ok;
 }
 
 // 库里存在、内存里已经没了的行（删除条目、历史上限裁剪都靠它）
-void DeleteMissingItems() {
+bool DeleteMissingItems() {
     std::string sql = "DELETE FROM items";
     if (!g_items.empty()) {
         sql += " WHERE id NOT IN (";
@@ -276,19 +290,20 @@ void DeleteMissingItems() {
             sql += (sql.back() == '(' ? "" : ",");
             sql += std::to_string(g_items[i].dbId);
         }
-        if (sql.back() == '(') return;               // 没有任何已入库的条目
+        if (sql.back() == '(') return true;          // 没有任何已入库的条目
         sql += ")";
     }
-    Exec(sql.c_str());
-    Exec("DELETE FROM files WHERE item_id NOT IN (SELECT id FROM items)");
+    if (!Exec(sql.c_str())) return false;
+    return Exec("DELETE FROM files WHERE item_id NOT IN (SELECT id FROM items)");
 }
 
-void SaveRecent() {
-    Exec("DELETE FROM recent");
+bool SaveRecent() {
+    if (!Exec("DELETE FROM recent")) return false;
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(g_db, "INSERT INTO recent(is_sym,ord,glyph,name) VALUES(?1,?2,?3,?4)",
                            -1, &s, nullptr) != SQLITE_OK)
-        return;
+        return false;
+    bool ok = true;
     for (int pass = 0; pass < 2; ++pass) {
         const std::vector<RecentGlyph>& src = pass ? g_recentSym : g_recentEmo;
         for (size_t i = 0; i < src.size(); ++i) {
@@ -297,10 +312,11 @@ void SaveRecent() {
             sqlite3_bind_int(s, 2, (int)i);
             sqlite3_bind_text(s, 3, src[i].g.c_str(), (int)src[i].g.size(), SQLITE_TRANSIENT);
             sqlite3_bind_text(s, 4, src[i].n.c_str(), (int)src[i].n.size(), SQLITE_TRANSIENT);
-            sqlite3_step(s);
+            if (sqlite3_step(s) != SQLITE_DONE) ok = false;
         }
     }
     sqlite3_finalize(s);
+    return ok;
 }
 
 // 提交成功后：超过阈值的正文已在库里，可以把它从内存放掉了。
@@ -315,6 +331,8 @@ void ReleaseLongTexts() {
 }
 
 }  // namespace
+
+bool HistoryFlushFailed() { return g_flushFailed; }
 
 // ================================================================== 图片副本与孤儿清理
 std::wstring HistoryDir() {
@@ -350,9 +368,11 @@ std::wstring StoreImageCopy(const std::vector<BYTE>& bits) {
 static void PruneOrphanImages() {
     std::wstring dir = HistoryImgDir();
     if (dir.empty()) return;
-    std::vector<std::wstring> keep;
+    // 用哈希集合：图集条目可能上千，逐个 wstring 比较是启动时的纯浪费
+    std::unordered_set<std::wstring> keep;
+    keep.reserve(g_items.size() * 2 + 1);
     for (const auto& it : g_items)
-        if (!it.diskPath.empty()) keep.push_back(FileNameOf(it.diskPath));
+        if (!it.diskPath.empty()) keep.insert(FileNameOf(it.diskPath));
 
     std::vector<std::wstring> dead;
     WIN32_FIND_DATAW fd{};
@@ -361,9 +381,7 @@ static void PruneOrphanImages() {
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         std::wstring name = fd.cFileName;
-        bool used = false;
-        for (const auto& k : keep) if (k == name) { used = true; break; }
-        if (!used) dead.push_back(name);
+        if (keep.find(name) == keep.end()) dead.push_back(std::move(name));
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     for (const auto& name : dead) DeleteFileW((dir + L"\\" + name).c_str());
@@ -501,7 +519,12 @@ void HistoryLoad() {
     // 用户改过「临时文件目录」：把上一份数据取到当前目录来。
     // 图片文件不搬（diskPath 是绝对路径，旧文件照样读得出来）。
     std::wstring mark;
-    if (ReadDirMark(mark) && mark != HistoryDir() && !FileExists(HistoryDbPath()))
+    bool hasMark = ReadDirMark(mark);
+    // 注意日志里要转成 UTF-8 再打：%ls 在当前 locale 下会把中文路径截断，
+    // 反而看不出「mark 和当前目录到底是不是同一个」。
+    Trace("  db: load mark=[%hs] hasMark=%d dir=[%hs] hasDb=%d", W2U8(mark).c_str(), (int)hasMark,
+          W2U8(HistoryDir()).c_str(), (int)FileExists(HistoryDbPath()));
+    if (hasMark && mark != HistoryDir() && !FileExists(HistoryDbPath()))
         MoveDataFromDir(mark);
     WriteDirMark(HistoryDir());
 
@@ -583,7 +606,7 @@ void HistoryLoad() {
 }
 
 void HistoryFlush() {
-    if (!OpenDb()) return;
+    if (!OpenDb()) { g_flushFailed = true; return; }
 
     // 图片条目若只有内存里的像素（上一次提交失败过），这里补一份文件，
     // 否则重启后这一条就只剩个空壳。
@@ -591,14 +614,27 @@ void HistoryFlush() {
         if (it.kind == 2 && it.diskPath.empty() && !it.bits.empty())
             it.diskPath = StoreImageCopy(it.bits);
 
-    Exec("BEGIN IMMEDIATE");
-    DeleteMissingItems();
-    for (auto& it : g_items) {
-        if (it.dbId <= 0) InsertItem(it);
-        else UpdateItem(it);
+    // BEGIN 必须先判：失败（库被别的进程独占、目录只读…）之后 SQLite 处于自动提交
+    // 模式，后面的 DELETE / INSERT 会各自单独提交——「删了旧的、新的没写进去」
+    // 就是这么来的，比整事务失败糟得多。所以失败就直接走人，一条语句都不执行。
+    if (!Exec("BEGIN IMMEDIATE")) {
+        Trace("  db: begin-failed, 本次不落盘（等下一次 HistoryTouch）");
+        g_flushFailed = true;
+        return;
     }
-    SaveRecent();
-    Exec("COMMIT");
+    bool ok = DeleteMissingItems();
+    for (auto& it : g_items) {
+        if (!ok) break;
+        ok = (it.dbId <= 0) ? InsertItem(it) : UpdateItem(it);
+    }
+    if (ok) ok = SaveRecent();
+    if (!ok || !Exec("COMMIT")) {
+        Exec("ROLLBACK");        // 回滚掉，内存里的条目原样保留，下次防抖再试
+        Trace("  db: flush-failed, rolled back");
+        g_flushFailed = true;
+        return;                  // 注意：这里绝不能 ReleaseLongTexts，正文还没进库
+    }
+    g_flushFailed = false;
 
     ReleaseLongTexts();      // 正文已进库，长文本从内存放掉
 }
@@ -615,7 +651,11 @@ static void MoveDataFromDir(const std::wstring& dir) {
     if (FileExists(oldDb)) {
         if (!FileExists(HistoryDbPath())) {
             CheckpointDb(oldDb);      // 先把它的 WAL 合并进去，否则搬过去的就是旧快照
-            MoveFileW(oldDb.c_str(), HistoryDbPath().c_str());
+            // 只有搬成功了才能删 WAL：删完再失败，那批已提交的事务就真没了
+            if (!MoveFileW(oldDb.c_str(), HistoryDbPath().c_str())) {
+                Trace("  db: migrate-move-failed err=%lu", (unsigned long)GetLastError());
+                return;
+            }
         }
         DeleteFileW((oldDb + L"-wal").c_str());
         DeleteFileW((oldDb + L"-shm").c_str());

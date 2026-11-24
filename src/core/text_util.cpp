@@ -10,6 +10,21 @@ std::wstring Lower(std::wstring s) {
     return s;
 }
 
+bool ContainsCI(const wchar_t* hay, size_t hayLen, const std::wstring& needleLower) {
+    if (needleLower.empty()) return true;
+    if (!hay || hayLen < needleLower.size()) return false;
+    const size_t last = hayLen - needleLower.size();
+    const wchar_t first = needleLower[0];
+    for (size_t i = 0; i <= last; ++i) {
+        // 先比首字符（绝大多数位置在这里就被排除），再逐字符确认整段
+        if ((wchar_t)towlower(hay[i]) != first) continue;
+        size_t j = 1;
+        while (j < needleLower.size() && (wchar_t)towlower(hay[i + j]) == needleLower[j]) ++j;
+        if (j == needleLower.size()) return true;
+    }
+    return false;
+}
+
 std::wstring U8N(const char* s, int n) {
     if (!s || n <= 0) return L"";
     int w = MultiByteToWideChar(CP_UTF8, 0, s, n, nullptr, 0);

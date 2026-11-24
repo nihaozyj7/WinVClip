@@ -1,0 +1,176 @@
+# 发布流水线：push 一个 v* 的 tag（或在 Actions 页面手动 Run workflow）即构建并发布 Release。
+#
+# 为什么这么写：
+#   1. 编译器不用 MSVC：本工程只有 MinGW 这条路验证过（-municode、windres + attach_icon 的资源
+#      贴附流程、ld 2.47 的 .rsrc 合并问题都是照着 MinGW/binutils 的特性写的）。CI 用 MSYS2 的
+#      mingw-w64 gcc，与本机一致的调用方式。
+#   2. 必须 -DWINVCLIP_STATIC_RUNTIME=ON：MinGW 默认动态链接 libstdc++/libgcc/libwinpthread，
+#      那样发出去的 exe 在没装 MSYS2 的机器上直接报「缺少 libstdc++-6.dll」打不开。
+#   3. 发布前校验两件事，任一不满足就中止（不发布半成品）：
+#      · exe 的 VERSIONINFO == tag 版本（防止 tag 打了但二进制是旧版本）；
+#      · 导入表里没有 MinGW 运行时 dll（防止静态链接选项被谁改掉后静默退回动态）。
+#   4. 不跑 tests/：那套是 desktop 交互回归（真窗口、真钩子、真剪贴板、SendInput），
+#      runner 没有可交互桌面，跑出来只会是假失败。发布前请在本地跑 python tests\run.py。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 1.0.0 或 v1.0.0（tag 不存在时在当前提交上创建）"
+        required: true
+        type: string
+
+# 创建 Release 需要写权限；默认的 read 权限会让 softprops 那一步 403。
+permissions:
+  contents: write
+
+# 同一版本重复触发时排队而不是并发去改同一个 Release。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          # generate_release_notes 要从上一个 tag 开始列提交，浅克隆拿不到历史。
+          fetch-depth: 0
+
+      - name: 解析版本号
+        id: ver
+        shell: pwsh
+        env:
+          # 走环境变量而不是往脚本里插值：手输的版本号若含引号，直接拼进 PowerShell 会被当成代码。
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $raw = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { $env:REF_NAME }
+          $raw = $raw.Trim()
+          if (-not $raw) { throw "版本号为空（workflow_dispatch 需要填 version）" }
+          if ($raw -notmatch '^v') { $raw = "v$raw" }
+          $num = $raw -replace '^v', ''
+          # 只允许数字点分：VERSIONINFO 的 FILEVERSION 必须是逗号分隔整数，
+          # 且 tag 里带斜杠/空格会污染后续的文件名。
+          if ($num -notmatch '^\d+\.\d+(\.\d+)?$') {
+            throw "版本号需形如 1.2 或 1.2.3，收到：$num"
+          }
+          "tag=$raw" >> $env:GITHUB_OUTPUT
+          "num=$num" >> $env:GITHUB_OUTPUT
+          Write-Host "tag=$raw num=$num"
+
+      - name: 安装 MinGW-w64 工具链
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          # 不 update：每次滚动更新整个 MSYS2 要几分钟，且会让构建结果随日期漂移。
+          update: false
+          install: mingw-w64-x86_64-gcc
+          # inherit：保留 runner 原有的 PATH（cmake / python / ninja 都在那儿），
+          # 只把 MSYS2 的 mingw64\bin 前置，让 g++ / windres 可被找到。
+          path-type: inherit
+
+      - name: 工具链自检
+        shell: pwsh
+        run: |
+          g++ --version | Select-Object -First 1
+          windres --version | Select-Object -First 1
+          cmake --version | Select-Object -First 1
+          python --version
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            Write-Host "ninja 缺失，安装……"
+            choco install ninja -y --no-progress
+          }
+          ninja --version
+
+      - name: 构建（静态运行时）
+        shell: pwsh
+        run: |
+          # 显式钉住编译器：runner 上除了 MSYS2 还装了 Strawberry Perl 自带的 gcc，
+          # 只靠 PATH 顺序选中谁的 gcc 是不确定的，混用会链接失败或误判。
+          $env:CC = (Get-Command gcc).Source
+          $env:CXX = (Get-Command g++).Source
+          Write-Host "CC  = $env:CC"
+          Write-Host "CXX = $env:CXX"
+          # -D 的值必须加引号：PowerShell 会把 -DX=1.0.0 里的点当分隔符拆成 `-DX=1` 和 `.0.0`，
+          # CMake 于是只收到主版本号（表现为 VERSIONINFO 变成 "1"，外加一条 "Ignoring extra path"）。
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release `
+            "-DWINVCLIP_VERSION=${{ steps.ver.outputs.num }}" `
+            "-DWINVCLIP_STATIC_RUNTIME=ON"
+          if ($LASTEXITCODE -ne 0) { throw "configure 失败" }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "构建失败" }
+
+      - name: 校验产物
+        shell: pwsh
+        env:
+          EXPECTED: ${{ steps.ver.outputs.num }}
+        run: |
+          $exe = "build/winvclip.exe"
+          if (-not (Test-Path $exe)) { throw "没有产物 $exe" }
+          $ver = (Get-Item $exe).VersionInfo.FileVersion
+          Write-Host "exe FileVersion = $ver / 期望 $env:EXPECTED"
+          if ($ver -ne $env:EXPECTED) { throw "版本不符：tag 是 $env:EXPECTED，exe 是 $ver" }
+          # 静态链接的判据：导入表里不该出现 MinGW 的运行时 dll
+          $deps = objdump -p $exe | Select-String 'DLL Name:'
+          $bad = $deps | Select-String 'libstdc\+\+|libgcc|libwinpthread'
+          if ($bad) {
+            $deps | ForEach-Object { Write-Host $_.Line.Trim() }
+            throw "仍动态依赖 MinGW 运行时，静态链接没生效：$bad"
+          }
+          Write-Host "依赖检查通过（共 $($deps.Count) 个系统 dll）"
+
+      - name: 打包
+        shell: pwsh
+        env:
+          NUM: ${{ steps.ver.outputs.num }}
+        run: |
+          $num = $env:NUM
+          $stage = "stage/WinVClip-$num"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item build/winvclip.exe $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path $stage -DestinationPath "WinVClip-$num-win64.zip" -Force
+          # 裸 exe 也单独发一份：它是完整功能的单文件，很多人只想要这个。
+          Copy-Item build/winvclip.exe "WinVClip-$num.exe"
+          $h = (Get-FileHash "WinVClip-$num-win64.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  WinVClip-$num-win64.zip" | Out-File -FilePath "WinVClip-$num-win64.zip.sha256" -Encoding ascii
+          Write-Host "zip sha256 = $h"
+          Get-ChildItem WinVClip-* | Select-Object Name, Length
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: WinVClip ${{ steps.ver.outputs.tag }}
+          # workflow_dispatch 手动触发时 tag 可能还不存在，用它指定在哪个提交上创建。
+          target_commitish: ${{ github.sha }}
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## WinVClip ${{ steps.ver.outputs.tag }}
+
+            Windows 剪贴板历史面板：按 `Win+V` 弹出，替代系统剪贴板历史。
+
+            **下载 `WinVClip-${{ steps.ver.outputs.num }}-win64.zip`（或直接下 `.exe`）**，解压后双击运行，
+            常驻托盘，无需安装、不写注册表、不需要 .NET 或运行库。
+
+            | 文件 | 说明 |
+            |---|---|
+            | `WinVClip-${{ steps.ver.outputs.num }}-win64.zip` | 程序 + README + LICENSE |
+            | `WinVClip-${{ steps.ver.outputs.num }}.exe` | 单文件，功能与 zip 内一致 |
+            | `*.sha256` | zip 的 SHA-256 校验值 |
+
+            系统要求：Windows 10 / 11（64 位）。以管理员身份运行才能接管以管理员权限运行的窗口。
+            历史记录明文存在 `%TEMP%\winvclip\history\`，首次运行会提示位置。
+
+            > 由 GitHub Actions 从 tag `${{ steps.ver.outputs.tag }}` 自动构建，二进制未做代码签名，
+            > 首次运行 SmartScreen 可能提示「未知发布者」，选「更多信息 → 仍要运行」。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

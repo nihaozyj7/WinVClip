@@ -10,6 +10,7 @@
 // DrawBitmap 的 source-over 才能得到平滑圆角（否则角上是脏的）。
 #include "image/raster.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -105,6 +106,111 @@ bool DibToRgba(const std::vector<BYTE>& dib, Rgba& out) {
     return ok;
 }
 
+// ---- 缩略图专用入口：解码/转换阶段就缩到 box 以内，不再产生全尺寸 BGRA 缓冲。
+// 6000×4000 的截图原本要走「全尺寸解码 + 全尺寸拷贝 + 盒式下采样」，
+// 实测那一步就是收藏页 50ms 级单帧尖峰的来源（见 docs/PERFORMANCE-REVIEW.md）。
+bool PngToThumb(const std::vector<BYTE>& png, int box, Rgba& out) {
+    InitWic();
+    if (!g_wic || png.size() < 32 || box <= 0) return false;
+    IWICStream* st = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* fr = nullptr;
+    IWICBitmapScaler* sc = nullptr;
+    IWICFormatConverter* cv = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(g_wic->CreateStream(&st)) &&
+        SUCCEEDED(st->InitializeFromMemory(const_cast<BYTE*>(png.data()), (DWORD)png.size())) &&
+        SUCCEEDED(g_wic->CreateDecoderFromStream(st, nullptr, WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &fr))) {
+        UINT sw = 0, sh = 0;
+        if (SUCCEEDED(fr->GetSize(&sw, &sh)) && sw > 0 && sh > 0 &&
+            (UINT64)sw * sh <= 64ull * 1024 * 1024) {
+            // 等比缩到 box 以内；比 box 还小的图不放大（放大了只是更糊）
+            double k = (double)box / (double)(sw > sh ? sw : sh);
+            if (k > 1.0) k = 1.0;
+            UINT tw = (UINT)(std::max)(1L, (long)lround((double)sw * k));
+            UINT th = (UINT)(std::max)(1L, (long)lround((double)sh * k));
+            IWICBitmapSource* src = fr;
+            if ((tw != sw || th != sh) && SUCCEEDED(g_wic->CreateBitmapScaler(&sc)) &&
+                SUCCEEDED(sc->Initialize(fr, tw, th, WICBitmapInterpolationModeFant))) {
+                src = sc;
+            }
+            if (SUCCEEDED(g_wic->CreateFormatConverter(&cv)) &&
+                SUCCEEDED(cv->Initialize(src, kWicFmt32BGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                        WICBitmapPaletteTypeCustom))) {
+                out.w = (int)tw; out.h = (int)th;
+                out.px.resize((size_t)tw * th * 4);
+                if (SUCCEEDED(cv->CopyPixels(nullptr, tw * 4, (UINT)out.px.size(), out.px.data())))
+                    ok = true;
+            }
+        }
+    }
+    if (cv) cv->Release();
+    if (sc) sc->Release();
+    if (fr) fr->Release();
+    if (dec) dec->Release();
+    if (st) st->Release();
+    return ok;
+}
+
+// CF_DIB 的像素起点与尺寸（各种头变体的偏移计算只写一次）
+static bool DibSourceInfo(const std::vector<BYTE>& dib, int& w, int& h, size_t& off) {
+    w = h = 0; off = 0;
+    if (dib.size() < sizeof(BITMAPINFOHEADER)) return false;
+    const BITMAPINFOHEADER* bi = (const BITMAPINFOHEADER*)dib.data();
+    if (bi->biSize < sizeof(BITMAPINFOHEADER) || bi->biWidth <= 0) return false;
+    w = bi->biWidth;
+    h = bi->biHeight < 0 ? -bi->biHeight : bi->biHeight;
+    if (w <= 0 || h <= 0 || (UINT64)w * h > 64ull * 1024 * 1024) return false;
+    off = bi->biSize;
+    if (bi->biCompression == BI_BITFIELDS && bi->biSize == sizeof(BITMAPINFOHEADER))
+        off += 12;                                   // 3 个 color mask 紧跟 40 字节头
+    if (bi->biBitCount <= 8)
+        off += (size_t)(bi->biClrUsed ? bi->biClrUsed : (1u << bi->biBitCount)) * 4;
+    return off < dib.size();
+}
+
+bool DibToThumb(const std::vector<BYTE>& dib, int box, Rgba& out) {
+    int sw = 0, sh = 0;
+    size_t off = 0;
+    if (box <= 0 || !DibSourceInfo(dib, sw, sh, off)) return false;
+    double k = (double)box / (double)(sw > sh ? sw : sh);
+    if (k > 1.0) k = 1.0;
+    int tw = (int)(std::max)(1L, (long)lround((double)sw * k));
+    int th = (int)(std::max)(1L, (long)lround((double)sh * k));
+
+    BITMAPINFO dst{};
+    dst.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    dst.bmiHeader.biWidth       = tw;
+    dst.bmiHeader.biHeight      = -th;               // 自上而下，与我们自己的行序一致
+    dst.bmiHeader.biPlanes      = 1;
+    dst.bmiHeader.biBitCount    = 32;
+    dst.bmiHeader.biCompression = BI_RGB;
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return false;
+    void* bits = nullptr;
+    HBITMAP bm = CreateDIBSection(dc, &dst, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bm || !bits) { if (bm) DeleteObject(bm); DeleteDC(dc); return false; }
+    HGDIOBJ ob = SelectObject(dc, bm);
+    // HALFTONE 让 GDI 自己做面积平均（等价于原来的盒式下采样）；必须先设 brush org，
+    // 否则 GDI 会把 brush origin 对齐到 (0,0) 而破坏平均。
+    SetStretchBltMode(dc, HALFTONE);
+    SetBrushOrgEx(dc, 0, 0, nullptr);
+    int lines = StretchDIBits(dc, 0, 0, tw, th, 0, 0, sw, sh, dib.data() + off,
+                              (BITMAPINFO*)dib.data(), DIB_RGB_COLORS, SRCCOPY);
+    bool ok = lines > 0;
+    if (ok) {
+        out.w = tw; out.h = th;
+        out.px.assign((BYTE*)bits, (BYTE*)bits + (size_t)tw * th * 4);
+        for (size_t i = 3; i < out.px.size(); i += 4) out.px[i] = 255;  // GDI 不给 alpha
+    }
+    SelectObject(dc, ob);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    return ok;
+}
+
 // 盒式平均下采样：把每个源像素按面积归到对应目标桶，一遍扫完
 void BoxDownsample(const Rgba& s, int tw, int th, std::vector<BYTE>& dst) {
     dst.assign((size_t)tw * th * 4, 0);
@@ -169,8 +275,13 @@ void ReadPngSize(const std::vector<BYTE>& b, int& w, int& h) {
     w = h = 0;
     if (b.size() < 24) return;
     if (!(b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')) return;
-    w = (b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19];
-    h = (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23];
+    // 用无符号拼接：b[i] 是 BYTE，`b[16] << 24` 会按 int 左移并溢出（UB），
+    // 宽高超过 2^23 时会算出负数。顺便按 PNG 规范判掉 0。
+    UINT32 uw = ((UINT32)b[16] << 24) | ((UINT32)b[17] << 16) | ((UINT32)b[18] << 8) | (UINT32)b[19];
+    UINT32 uh = ((UINT32)b[20] << 24) | ((UINT32)b[21] << 16) | ((UINT32)b[22] << 8) | (UINT32)b[23];
+    if (uw == 0 || uh == 0 || uw > 0x7FFFFFFFu || uh > 0x7FFFFFFFu) return;
+    w = (int)uw;
+    h = (int)uh;
 }
 
 bool SameBits(const std::vector<BYTE>& a, const std::vector<BYTE>& b) {

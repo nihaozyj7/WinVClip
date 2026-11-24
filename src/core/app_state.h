@@ -125,6 +125,12 @@ extern bool   g_toastOn, g_toastInfo;
 extern bool   g_menuOpen;
 extern int    g_menuRow, g_menuHover;
 extern int    g_menuItem;      // 呼出菜单时锁定的条目在 g_items 中的绝对下标
+// 上面那个下标只在「菜单打开的这一小段时间里」有效：期间的剪贴板变化会让
+// BuildView / g_items 整体错位，于是按下「删除」删掉的可能是另一条。
+// 所以呼出菜单时同时记下这条的身份，执行动作前先比对（见 actions.cpp RunMenuItem）。
+extern int    g_menuDbId;
+extern SYSTEMTIME g_menuSt;
+extern std::wstring g_menuTitle;
 extern POINT  g_menuPt;        // 右键呼出菜单时的光标位置（客户区坐标）
 extern bool   g_dialogOpen;    // 文件对话框打开期间禁止「失焦即隐藏」
 extern bool   g_modalOpen;

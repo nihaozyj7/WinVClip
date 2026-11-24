@@ -25,6 +25,15 @@ bool PngToRgba(const std::vector<BYTE>& png, wv::Rgba& out);
 // CF_DIB 交 GDI 统一成 32bpp 自上而下（省掉位深/调色板/上下翻转的解析）
 bool DibToRgba(const std::vector<BYTE>& dib, wv::Rgba& out);
 
+// ---- 缩略图专用：直接在解码/转换阶段缩到 box 以内，不产生全尺寸缓冲。
+// 为什么单独两个函数而不是给上面两个加参数：DibToRgba 还被「另存为图片」用着
+// （ui/actions.cpp 要原尺寸），改它的语义会把保存出来的图变小。
+//   · PngToThumb：WIC 解码 → IWICBitmapScaler（Fant 插值）→ 32bpp，只拷 box 大小的像素
+//   · DibToThumb：StretchDIBits 一次完成「位深统一 + 缩放到 box」两件事
+// 上面那张 6000×4000 的截图因此省掉一份 ~96MB 的全尺寸拷贝（实测 50ms 级长尾就来自它）。
+bool PngToThumb(const std::vector<BYTE>& png, int box, wv::Rgba& out);
+bool DibToThumb(const std::vector<BYTE>& dib, int box, wv::Rgba& out);
+
 // 盒式下采样：面积平均，缩略图场景比双线性更干净（不会在细线处振铃）
 void BoxDownsample(const wv::Rgba& s, int tw, int th, std::vector<BYTE>& dst);
 

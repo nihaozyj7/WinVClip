@@ -19,6 +19,16 @@ namespace wv {
 // 逐字符转小写（宽字符，用于不区分大小写的过滤）
 std::wstring Lower(std::wstring s);
 
+// 不区分大小写的子串查找（needle 需已小写化）。**不分配内存**：搜索路径上每敲一个键
+// 都会对全部条目做匹配，而 Lower(...) 是按值收参、拷两次，历史里有几条 16KB 正文时
+// 每次 BuildView 就是几百 KB 的分配/释放。逐字符 towlower 比较足够（ASCII 大小写 +
+// 中文本身无大小写）。
+bool ContainsCI(const wchar_t* hay, size_t hayLen, const std::wstring& needleLower);
+
+inline bool ContainsCI(const std::wstring& hay, const std::wstring& needleLower) {
+    return ContainsCI(hay.c_str(), hay.size(), needleLower);
+}
+
 // UTF-8 → UTF-16，固定长度 n（不依赖 '\0' 结尾，用于解析内嵌数据表）
 std::wstring U8N(const char* s, int n);
 

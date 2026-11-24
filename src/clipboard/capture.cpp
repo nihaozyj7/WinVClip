@@ -157,15 +157,28 @@ static bool SameText(const ClipItem& old, const std::wstring& text) {
     return EnsureItemText(tmp) && tmp.text == text;
 }
 
-void CaptureClipboard() {
+// 返回值 = 「历史是否真的变了」。调用方（TIMER_CLIP）据此决定要不要重建视图：
+// 剪贴板序号变了但内容与已有条目重复、或者只是被清空，都不该触发一次全量重排 + 重绘。
+// 剪贴板被占用时的退避步长（毫秒）。成功打开后清零，见函数内说明。
+static int g_clipRetry = 0;
+
+bool CaptureClipboard() {
     DWORD seq = GetClipboardSequenceNumber();
     // 自己写进去的内容（借用剪贴板粘贴表情/符号、或还原备份）不进历史，
     // 否则每点一个表情，历史里就多一条孤零零的 emoji。
-    if (g_selfClipSeq && seq == g_selfClipSeq) return;
+    if (g_selfClipSeq && seq == g_selfClipSeq) return false;
     // 用户刚删掉的那条正躺在剪贴板里（见 app_state.h 的 g_delClipSeq）：
     // 唤出面板时这次补捕必须跳过它，否则删掉的内容立刻被捡回来。
-    if (g_delClipSeq && seq == g_delClipSeq) return;
-    if (!OpenClipboard(g_main)) { SetTimer(g_main, TIMER_CLIP, 160, nullptr); return; }
+    if (g_delClipSeq && seq == g_delClipSeq) return false;
+    if (!OpenClipboard(g_main)) {
+        // 剪贴板被别人占着：OpenClipboard 立即失败（不等待），退避重试。
+        // 固定 160ms 无限重试在「有个程序长期持着剪贴板」时会一直滴答，这里指数退避到 2s 封顶。
+        static const int kStep[5] = {160, 320, 640, 1200, 2000};
+        SetTimer(g_main, TIMER_CLIP, kStep[g_clipRetry < 5 ? g_clipRetry : 4], nullptr);
+        if (g_clipRetry < 5) ++g_clipRetry;
+        return false;
+    }
+    g_clipRetry = 0;
 
     ClipItem it;
     GetLocalTime(&it.st);
@@ -226,7 +239,7 @@ void CaptureClipboard() {
         it.hash = HashBits(it.bits);
     }
 
-    if (it.text.empty() && it.files.empty() && it.kind != 2) return;
+    if (it.text.empty() && it.files.empty() && it.kind != 2) return false;
 
     if (it.kind == 0) {
         std::wstring t = it.text;
@@ -272,7 +285,7 @@ void CaptureClipboard() {
             else if (it.kind == 1) same = (f.files == it.files);
             else same = EnsureItemBits(f) && sameBits(f, it);
         }
-        if (same) return;
+        if (same) return false;
         for (size_t i = 1; i < g_items.size(); ++i) {
             ClipItem& o = g_items[i];
             bool dup = (o.kind == it.kind);
@@ -294,4 +307,5 @@ void CaptureClipboard() {
     g_items.push_front(std::move(it));
     ApplyHistoryLimit();      // 历史上限 + 图片像素的内存预算（见 settings.h）
     HistoryTouch();           // 新条目排一次防抖落盘
+    return true;
 }

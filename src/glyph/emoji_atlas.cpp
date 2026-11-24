@@ -70,13 +70,22 @@ int EmojiStride() { return g_emoSz + S(4); }
 int EmojiSide()   { return g_emoAtlasCols * EmojiStride(); }
 
 // -------------------------------------------------------------- 预热镜像（按需大块）
-static void FreeEmoDisk() {
+// ⚠ 这三处必须与 worker 共用 g_emoMx：worker 在锁内把像素 memcpy 进 g_emoDisk
+// （见 EmojiWorkerMain 尾部），而 FreeEmoDisk / AllocEmoDisk 在 UI 线程。
+// 早先都裸操作指针，等于「可能把 worker 正在写的那 19.5MB 释放掉」——真实竞态。
+static void FreeEmoDiskLocked() {
     if (g_emoDisk) { VirtualFree(g_emoDisk, 0, MEM_RELEASE); g_emoDisk = nullptr; }
     g_emoDiskSlots = 0;
 }
 
+static void FreeEmoDisk() {
+    std::lock_guard<std::mutex> lk(g_emoMx);
+    FreeEmoDiskLocked();
+}
+
 static void AllocEmoDisk(size_t slots, size_t perSlot) {
-    FreeEmoDisk();
+    std::lock_guard<std::mutex> lk(g_emoMx);
+    FreeEmoDiskLocked();
     if (!slots || !perSlot) return;
     SIZE_T bytes = slots * perSlot * sizeof(uint32_t);
     g_emoDisk = (uint32_t*)VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -133,6 +142,11 @@ void EmojiWorkerMain(int sz) {
     if (!ready) WarmLog("  warm: worker-not-ready sz=%d\n", sz, 0);
 
     std::vector<uint32_t> px((size_t)stride * stride);
+    // 画刷颜色恒定（黑），建一次就够：1911 格各建一个 ID2D1SolidColorBrush
+    // 纯属把冷启动时间花在 COM 分配上。
+    ID2D1SolidColorBrush* br = nullptr;
+    if (ready && FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &br)))
+        br = nullptr;
     for (;;) {
         EmoReq r;
         {
@@ -160,12 +174,10 @@ void EmojiWorkerMain(int sz) {
         rt->BeginDraw();
         rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
         rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        ID2D1SolidColorBrush* br = nullptr;
-        if (SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &br)) && br) {
+        if (br) {
             rt->DrawTextW(w.c_str(), (UINT32)w.size(), fmt,
                           D2D1::RectF(0.0f, 0.0f, (float)sz, (float)sz), br,
                           D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-            br->Release();
         }
         rt->EndDraw();
         std::memcpy(px.data(), bits, (size_t)stride * stride * 4);
@@ -180,6 +192,7 @@ void EmojiWorkerMain(int sz) {
         g_emoDone.push_back(EmoDone{r.slot, r.key, px});
     }
 
+    if (br) br->Release();
     if (fmt) fmt->Release();
     if (rt) rt->Release();
     if (dwf) dwf->Release();
@@ -372,22 +385,20 @@ bool LoadEmojiCache() {
         std::vector<uint32_t> px((size_t)slots * stride * stride, 0);
         if (fread(px.data(), 4, px.size(), fp) != px.size()) break;
 
-        D2D1_RECT_U all{0, 0, (UINT32)axis, (UINT32)axis};
-        HRESULT hr = g_emoAtlas->CopyFromMemory(&all, px.data(), (UINT32)(axis * 4));
-        // 逐格再确认一遍：实测「一次性整块 CopyFromMemory」在软件 DCRenderTarget 上
-        // 会返回 S_OK 但内容错位（每格都像被压扁的邻居），所以始终以逐格为准。
+        // 逐格上传。早先这里还有一次「整块一枪」的 CopyFromMemory：实测在软件
+        // DCRenderTarget 上返回 S_OK 却内容错位（每格像被压扁的邻居），所以本来
+        // 就要靠下面的逐格覆盖来兜底——那 19.5MB 的一次性拷贝纯属白做。
         for (auto& e : idx) {
             D2D1_RECT_U r;
             r.left = (UINT32)((e.first % cols) * stride);
             r.top = (UINT32)((e.first / cols) * stride);
             r.right = r.left + (UINT32)stride;
             r.bottom = r.top + (UINT32)stride;
-            if (FAILED(g_emoAtlas->CopyFromMemory(&r, px.data() + (size_t)e.first * stride * stride,
-                                                  (UINT32)(stride * 4)))) {
-                WarmLog("  load: cell-copy-fail slot=%d hr=0x%x\n", e.first, (int)hr);
-            }
+            HRESULT chr = g_emoAtlas->CopyFromMemory(&r, px.data() + (size_t)e.first * stride * stride,
+                                                     (UINT32)(stride * 4));
+            if (FAILED(chr)) WarmLog("  load: cell-copy-fail slot=%d hr=%d\n", e.first, (int)chr);
         }
-        WarmLog("  load: cells=%d bulk-hr=0x%x\n", count, (int)hr);
+        WarmLog("  load: cells=%d\n", count, 0);
 
         for (auto& e : idx) {
             g_emoSlot[e.second] = e.first;
@@ -405,18 +416,21 @@ bool LoadEmojiCache() {
 }
 
 // 把整块图集写盘。数据源是预热期间的镜像 g_emoDisk，写完即释放。
-void SaveEmojiCache() {
-    if (g_emoWarmSaved || !g_emoDisk || !g_emoAtlas) return;
-    g_emoWarmSaved = true;
+// 调用前提：**预热格全部就绪**（见 PumpEmojiUploads 末尾）。镜像里只要有一格
+// 没渲染过，写出去的缓存就会带着空洞，而下次启动整块读回时会全标成 ready ——
+// 那批表情就永久空白，且自己不会恢复（只能删缓存文件）。
+// 返回是否真的写成功：只有成功才置 g_emoWarmSaved，失败允许下一次重试。
+bool SaveEmojiCache() {
+    if (g_emoWarmSaved || !g_emoDisk || !g_emoAtlas) return false;
 
     const int stride = EmojiStride();
     const int axis = EmojiSide();
     int count = 0;
     for (auto& k : g_emoSlotKey) if (!k.empty()) ++count;
-    if (count <= 0) return;
+    if (count <= 0) return false;
 
     FILE* fp = _wfopen(EmojiCacheFile().c_str(), L"wb");
-    if (!fp) return;
+    if (!fp) return false;
     unsigned int hdr[8] = {0x564F4D45u, 2u, (unsigned)g_emoSz, (unsigned)stride,
                            (unsigned)g_emoAtlasCols, (unsigned)g_emoAtlasSlots,
                            (unsigned)count, (unsigned)axis};
@@ -428,11 +442,19 @@ void SaveEmojiCache() {
         fwrite(&l, 4, 1, fp);
         fwrite(g_emoSlotKey[i].data(), 1, l, fp);
     }
-    fwrite(g_emoDisk, 4, g_emoDiskSlots * (size_t)stride * stride, fp);
-    fclose(fp);
+    {   // 镜像本体在锁里读：走到这里 worker 已经停了，但指针归谁仍以锁为准
+        std::lock_guard<std::mutex> lk(g_emoMx);
+        if (!g_emoDisk) { fclose(fp); return false; }
+        fwrite(g_emoDisk, 4, g_emoDiskSlots * (size_t)stride * stride, fp);
+    }
+    bool ok = (fclose(fp) == 0);
+    if (!ok) return false;
+
+    g_emoWarmSaved = true;
     WarmLog("  warm: saved slots=%d up=%d\n", g_emoAtlasSlots, g_emoUpN);
 
     FreeEmoDisk();               // 直接 VirtualFree，页立刻还给系统
+    return true;
 }
 
 // 启动预热：读缓存命中就整块恢复，否则把全部 emoji 排进低优先队列
@@ -479,8 +501,10 @@ void StartEmojiWarm() {
 
 // 把工作线程做好的像素搬进 atlas，并在全量预热跑完后落盘。
 // 与当前页面无关：预热期间面板可能没显示、也可能停在历史页，都得继续推进。
-// 返回是否还有未完成的活（调用方据此续排定时器）。
-bool PumpEmojiUploads() {
+// 返回是否还有未完成的活（调用方据此续排定时器）；uploaded 回传本帧真正上传的格数
+// —— 调用方只有在上传发生时才需要重绘（否则 8ms 一次的轮询会变成 125Hz 全帧重绘）。
+bool PumpEmojiUploads(int* uploaded) {
+    if (uploaded) *uploaded = 0;
     if (!g_emoAtlas) return false;
     const int stride = EmojiStride();
     const int cols = g_emoAtlasCols;
@@ -521,18 +545,41 @@ bool PumpEmojiUploads() {
     }
 
     // 全部预热格都进 atlas 了：整块落盘，下次启动直接载入
-    if (g_emoWarmSlots > 0 && !g_emoWarmSaved && g_emoUpN >= g_emoWarmSlots) SaveEmojiCache();
-
+    // 全部活干完：把整块镜像落盘（下次启动直接载入），然后收掉 worker。
     bool more;
     {
         std::lock_guard<std::mutex> lk(g_emoMx);
         more = !g_emoPending.empty() || !g_emoDone.empty() ||
                g_emoWarmIdx.load() < (int)g_emoWarmJobs.size();
     }
-    // 手头的活全部干完（预热落盘也已结束）：把 worker 连同它的 D2D 设备一起停掉。
-    // 设备是内存大户（每套 25~32MB 非缓冲私有池），而「全部字形都已在图集里」之后
-    // 它唯一的作用是将来遇到新字形时再光栅化——那种情况由 EnsureEmojiWorker 现拉起来。
-    if (!more) StopEmojiWorker();
+    if (g_emoDisk) {
+        if (more) {
+            // 还没跑完：什么都不做，继续攒
+        } else {
+            // 手头的活全部干完（预热落盘也已结束）：把 worker 连同它的 D2D 设备一起停掉。
+            // 设备是内存大户（每套 25~32MB 非缓冲私有池），而「全部字形都已在图集里」之后
+            // 它唯一的作用是将来遇到新字形时再光栅化——那种情况由 EnsureEmojiWorker 现拉起来。
+            StopEmojiWorker();
+            // 落盘条件必须是「预热格真的全在」，而不是「上传计数够了」：
+            // g_emoUpN 里混着视口抢跑的格子，计数相等也可能有空洞（N1）。
+            bool allReady = true;
+            for (const auto& j : g_emoWarmJobs) {
+                if (j.slot < 0 || (size_t)j.slot >= g_emoReady.size() ||
+                    !g_emoReady[(size_t)j.slot]) { allReady = false; break; }
+            }
+            if (!allReady) {
+                WarmLog("  warm: skip-save, holes up=%d\n", g_emoUpN, 0);
+                FreeEmoDisk();          // 攒了张有洞的镜像，留着也只是占 19.5MB
+            } else if (!SaveEmojiCache()) {
+                // 写盘失败（磁盘满/目录只读）：别把 19.5MB 一直攥着，本会话不再重试
+                WarmLog("  warm: save-failed\n", 0, 0);
+                FreeEmoDisk();
+            }
+        }
+    } else if (!more) {
+        StopEmojiWorker();
+    }
+    if (uploaded) *uploaded = up;
     return more;
 }
 
@@ -552,7 +599,7 @@ void PrepareEmojiBitmaps() {
     }
 
     // 1) 先把工作线程做好的像素搬进 atlas（与当前页面无关，预热期间也要推进）
-    bool more = PumpEmojiUploads();
+    bool more = PumpEmojiUploads(nullptr);
 
     // 2) 刷新可见槽位的「最近使用」（淘汰兜底用）
     ++g_emoFrame;
@@ -634,7 +681,11 @@ void PrepareEmojiBitmaps() {
         }
     }
 
-    // 5) 还有格子在路上（或预热未完成）：排一个 8ms 的重绘，补齐后自然停下
+    // 5) 还有格子在路上（或预热未完成）：排一个 8ms 的轮询。
+    //    注意这里只是「轮询」：重绘由 panel 的 TIMER_EMOJI 按「本帧有没有真上传」决定，
+    //    早先无条件 Redraw，结果预热期间整帧以 125Hz 重绘（约 3 秒，正好撞在用户滚动的时候）。
+    //    本函数是在 PaintPanel 的绘制之前调用的，所以刚上传的格子这一帧就会画出来，
+    //    不需要再额外作废一次。
     if (more && g_panel) SetTimer(g_panel, TIMER_EMOJI, 8, nullptr);
 }
 

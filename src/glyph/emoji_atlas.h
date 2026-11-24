@@ -57,8 +57,10 @@ void StartEmojiWarm();
 // 有新字形要渲染时靠这个把它拉回来
 void EnsureEmojiWorker();
 
-// UI 定时器驱动：把 worker 交回的像素上传进 atlas，返回是否还有工作在途
-bool PumpEmojiUploads();
+// UI 定时器驱动：把 worker 交回的像素上传进 atlas，返回是否还有工作在途。
+// uploaded 回传本帧真正上传的格数：0 表示「这一帧什么都没变」，调用方不必重绘
+// （预热期间 8ms 轮询可能连续好几帧都没格子落地）。
+bool PumpEmojiUploads(int* uploaded);
 
 // 绘制前调用：把当前视口内的格子排进高优先队列
 void PrepareEmojiBitmaps();
