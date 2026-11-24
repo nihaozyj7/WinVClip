@@ -23,6 +23,11 @@ on:
         description: "版本号，如 1.0.0 或 v1.0.0（tag 不存在时在当前提交上创建）"
         required: true
         type: string
+      dry_run:
+        description: "只构建不发布（产物作为 artifact 上传，便于验证流水线）"
+        required: false
+        default: false
+        type: boolean
 
 # 创建 Release 需要写权限；默认的 read 权限会让 softprops 那一步 403。
 permissions:
@@ -144,7 +149,21 @@ jobs:
           Write-Host "zip sha256 = $h"
           Get-ChildItem WinVClip-* | Select-Object Name, Length
 
+      # dry run：产物作为 artifact 留在这次运行里，不发 Release。用于改完 workflow 后先验一次，
+      # 免得把不通的流水线直接暴露成一次「正式发布」。
+      - name: 上传产物（dry run）
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinVClip-${{ steps.ver.outputs.num }}-win64
+          path: |
+            WinVClip-*.zip
+            WinVClip-*.exe
+            WinVClip-*.sha256
+          if-no-files-found: error
+
       - name: 发布 Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
