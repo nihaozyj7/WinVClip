@@ -43,7 +43,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: 检出源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # generate_release_notes 要从上一个 tag 开始列提交，浅克隆拿不到历史。
           fetch-depth: 0
@@ -73,12 +73,14 @@ jobs:
       - name: 安装 MinGW-w64 工具链
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          # UCRT64 而不是 MINGW64：MSYS2 已把 MINGW64（msvcrt）标为弃用，且 Windows 10/11
+          # 自带 UCRT，运行时不需要额外装任何东西。
+          msystem: UCRT64
           # 不 update：每次滚动更新整个 MSYS2 要几分钟，且会让构建结果随日期漂移。
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-ucrt-x86_64-gcc
           # inherit：保留 runner 原有的 PATH（cmake / python / ninja 都在那儿），
-          # 只把 MSYS2 的 mingw64\bin 前置，让 g++ / windres 可被找到。
+          # 只把 MSYS2 的 ucrt64\bin 前置，让 g++ / windres 可被找到。
           path-type: inherit
 
       - name: 工具链自检
@@ -153,7 +155,7 @@ jobs:
       # 免得把不通的流水线直接暴露成一次「正式发布」。
       - name: 上传产物（dry run）
         if: ${{ inputs.dry_run }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: WinVClip-${{ steps.ver.outputs.num }}-win64
           path: |
@@ -164,7 +166,7 @@ jobs:
 
       - name: 发布 Release
         if: ${{ !inputs.dry_run }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: WinVClip ${{ steps.ver.outputs.tag }}
